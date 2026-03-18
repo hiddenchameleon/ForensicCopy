@@ -1,0 +1,99 @@
+use std::fs;
+use std::path::PathBuf;
+use std::io::Write;
+use chrono::Local;
+use crate::errors::ForensicError;
+use crate::copier::FileCopyResult;
+use crate::hasher::HashingAlgorithm;
+
+pub struct ReportConfig {
+    pub enabled: bool,
+    pub output_path: Option<PathBuf>,
+}
+
+pub fn generate_report(
+    results: &[FileCopyResult],
+    source: &str,
+    destination: &str,
+    algorithm: &HashingAlgorithm,
+    total_time_ms: u64,
+    config: &ReportConfig,
+) -> Result<(), ForensicError> {
+    if !config.enabled {
+        return Ok(());
+    }
+    let mut report = String::new();
+    report.push_str("==========================================================\n");
+    report.push_str("                Forensic Copy Report                      \n");
+    report.push_str("==========================================================\n");
+    let now = Local::now();
+    report.push_str(&format!("Date/Time:    {}\n", now.format("%Y-%m-%d %H:%M:%S")));
+    let algo_name = match algorithm {
+        HashingAlgorithm::Sha256 => "SHA256",
+        HashingAlgorithm::Blake3 => "BLAKE3",
+    };
+    report.push_str(&format!("Algorithm Used: {}\n", algo_name));
+    let total_files = results.len();
+    let total_size: u64 = results.iter().map(|r| r.file_size).sum();
+    let verified_count = results.iter().filter(|r| r.verified).count();
+    let failed_count = total_files - verified_count;
+    let avg_time_ms = if total_files > 0 { total_time_ms / total_files as u64 } else { 0 };
+    
+    report.push_str("----------------------------------------------------------\n");
+    report.push_str(&format!("Source:             {}\n", source));
+    report.push_str(&format!("Destination:        {}\n", destination));
+    report.push_str(&format!("Total Files:   {}\n", total_files.to_string()));
+    report.push_str(&format!("Total Size:    {}\n", format_size(total_size)));
+    report.push_str(&format!("Total Time:    {}\n", format_duration(total_time_ms)));
+    report.push_str(&format!("Avg Time/File: {}\n", format_duration(avg_time_ms)));
+    report.push_str(&format!("Verified:      {}\n", verified_count.to_string()));
+    report.push_str(&format!("Failed:        {}\n", failed_count.to_string()));
+    report.push_str("----------------------------------------------------------\n");
+    report.push_str("FILE DETAILS:\n");
+    report.push_str("----------------------------------------------------------\n");
+
+    for result in results {
+        if result.verified {report.push_str("[PASS]  ")} else {report.push_str("[FAIL]  ")};
+        report.push_str(&format!("{}\n", result.source_path.display()));
+        report.push_str(&format!("   Size:             {}\n", format_size(result.file_size)));
+        report.push_str(&format!("   Source Hash:      {}\n", result.src_hash));
+        report.push_str(&format!("   Destination Hash: {}\n", result.dest_hash));
+        report.push_str(&format!(".  Destination Path: {}\n", result.dest_path.display()));
+        report.push_str(&format!("   Time:             {}\n", format_duration(result.copy_time_ms)));
+        if let Some(err) = &result.error {
+            report.push_str(&format!("   Error:            {}\n", err));
+        }
+        report.push_str("\n");
+    }
+    report.push_str("==========================================================\n");
+
+    match &config.output_path {
+        None => println!("{}", report),
+        Some(path) => {
+            let mut file = fs::File::create(path).map_err(|e| ForensicError::ReportWriteFailed(e.to_string()))?;
+            file.write_all(report.as_bytes()).map_err(|e| ForensicError::ReportWriteFailed(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes >= 1_073_741_824 {
+        format!("{:.2} GB", bytes as f64 / 1_073_741_824.0)
+    } else if bytes >= 1_048_576 {
+        format!("{:.2} MB", bytes as f64 / 1_048_576.0)
+    } else if bytes >= 1_024 {
+        format!("{:.2} KB", bytes as f64 / 1_024.0)
+    } else {
+        format!("{} bytes", bytes)
+    }
+}
+pub fn format_duration(ms: u64) -> String {
+    if ms >= 60_000 {
+        format!("{:.2}m", ms as f64 / 60_000.0)
+    } else if ms >= 1_000 {
+        format!("{:.2}s", ms as f64 / 1_000.0)
+    } else {
+        format!("{}ms", ms)
+    }
+}
