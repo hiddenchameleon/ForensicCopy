@@ -8,6 +8,7 @@ use crate::hasher::HashingAlgorithm;
 use crate::hasher::{hash_file_with_progress};
 use crate::HashMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+use std::collections::HashSet;
 
 const LARGE_FILE_THRESHOLD: u64 = 100 *1024 * 1024;
 
@@ -26,7 +27,16 @@ pub struct FileCopyResult {
 
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
     let mut files = Vec::new();
+    let mut seen = HashSet::new();
 
+    collect_files_inner(dir, &mut files, &mut seen)?;
+    Ok(files)
+}
+fn collect_files_inner(
+    dir: &Path,
+    files: &mut Vec<PathBuf>,
+    seen: &mut HashSet<PathBuf>,
+) -> Result<(), ForensicError> {
     let entries = fs::read_dir(dir)
         .map_err(|e| ForensicError::DirectoryNotReadable(e.to_string()))?;
 
@@ -35,20 +45,23 @@ pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
         let path = entry.path();
 
         if path.is_dir() {
-            let mut sub_files = collect_files(&path)?;
-            files.append(&mut sub_files);
+            collect_files_inner(&path, files, seen)?;
         } else {
             let file_name = path.file_name()
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             if !file_name.starts_with("._") {
-                files.push(path);
+                // Use canonicalize to resolve any symlinks before deduplication
+                let canonical = fs::canonicalize(&path)
+                    .unwrap_or_else(|_| path.clone());
+                if seen.insert(canonical) {
+                    files.push(path);
+                }
             }
         }
     }
-    Ok(files)
+    Ok(())
 }
-
 fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     let src_meta = fs::metadata(src).map_err(|e| e.to_string())?;
 

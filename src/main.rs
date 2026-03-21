@@ -18,7 +18,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     
     if args.len() < 3 {
-        println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3] [--no-hash] [--no-verify] [--report] [--report_path <path>]");
+        println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3] [--no-hash] [--no-verify] [--report] [--report-path <path>]");
         return;
     }
 
