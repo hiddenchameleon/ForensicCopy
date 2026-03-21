@@ -1,10 +1,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use filetime::FileTime;
 use rayon::prelude::*;
 use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
-use crate::hasher::hash_file;
+use crate::hasher::{hash_file_with_progress};
+use crate::HashMode;
+use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
+
+const LARGE_FILE_THRESHOLD: u64 = 100 *1024 * 1024;
 
 #[derive(Debug)]
 pub struct FileCopyResult {
@@ -16,6 +21,7 @@ pub struct FileCopyResult {
     pub verified: bool,
     pub error: Option<String>,
     pub copy_time_ms: u64,
+    pub metadata_error: Option<String>,
 }
 
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
@@ -32,19 +38,143 @@ pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
             let mut sub_files = collect_files(&path)?;
             files.append(&mut sub_files);
         } else {
-            files.push(path);
+            let file_name = path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            if !file_name.starts_with("._") {
+                files.push(path);
+            }
         }
     }
     Ok(files)
 }
 
-pub fn forensic_copy(source: &str, destination: &str, algorithm: &HashingAlgorithm) -> Result<Vec<FileCopyResult>, ForensicError> {
-    
-    let source_path = Path::new(source);
-    if !source_path.exists() {
-        return Err(ForensicError::DirectoryNotFound(source_path.display().to_string()));
+fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
+    let src_meta = fs::metadata(src).map_err(|e| e.to_string())?;
+
+    // --- Timestamps (atime + mtime, cross-platform) ---
+    let atime = FileTime::from_last_access_time(&src_meta);
+    let mtime = FileTime::from_last_modification_time(&src_meta);
+    filetime::set_file_times(dest, atime, mtime).map_err(|e| e.to_string())?;
+
+    // --- Birthtime (Windows) ---
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{FILETIME, HANDLE};
+        use windows::Win32::Storage::FileSystem::{SetFileTime, FILE_WRITE_ATTRIBUTES};
+
+        let birthtime = src_meta.creation_time();
+        let creation_ft = FILETIME {
+            dwLowDateTime: (birthtime & 0xFFFFFFFF) as u32,
+            dwHighDateTime: (birthtime >> 32) as u32,
+        };
+
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(FILE_WRITE_ATTRIBUTES.0)
+            .open(dest)
+            .map_err(|e| format!("birthtime open: {}", e))?;
+
+        let handle = HANDLE(file.as_raw_handle() as isize);
+
+        unsafe {
+            SetFileTime(handle, Some(&creation_ft), None, None)
+                .map_err(|e| format!("birthtime set: {}", e))?;
+        }
     }
-    if !source_path.is_dir() {
+
+    // --- Birthtime (macOS) ---
+    #[cfg(target_os = "macos")]
+    {
+        use libc::{attrlist, setattrlist, ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME};
+        use std::ffi::CString;
+
+        let birthtime = src_meta.created()
+            .map_err(|e| format!("birthtime read: {}", e))?;
+        let secs = birthtime
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| format!("birthtime duration: {}", e))?
+            .as_secs() as libc::time_t;
+
+        let dest_cstr = CString::new(dest.to_string_lossy().as_bytes())
+            .map_err(|e| format!("birthtime path: {}", e))?;
+
+        #[repr(C)]
+        struct AttrBuf {
+            ts: libc::timespec,
+        }
+
+        let buf = AttrBuf {
+            ts: libc::timespec { tv_sec: secs, tv_nsec: 0 },
+        };
+
+        let mut attrs: attrlist = unsafe { std::mem::zeroed() };
+        attrs.bitmapcount = ATTR_BIT_MAP_COUNT;
+        attrs.commonattr = ATTR_CMN_CRTIME;
+
+        let result = unsafe {
+            setattrlist(
+                dest_cstr.as_ptr(),
+                &mut attrs as *mut attrlist as *mut libc::c_void,
+                &buf as *const AttrBuf as *mut libc::c_void,
+                std::mem::size_of::<AttrBuf>(),
+                0,
+            )
+        };
+
+        if result != 0 {
+            return Err(format!("birthtime setattrlist failed (errno {})", result));
+        }
+    }
+
+    // --- Birthtime (Linux) --- not supported, log as warning
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        return Err(String::from("birthtime preservation not supported on Linux"));
+    }
+
+    // --- Permissions (Unix only) ---
+    #[cfg(unix)]
+    {
+        let permissions = src_meta.permissions();
+        fs::set_permissions(dest, permissions).map_err(|e| e.to_string())?;
+    }
+
+    // --- Ownership (Unix only, best-effort) ---
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        use nix::unistd::{chown, Gid, Uid};
+        let uid = Uid::from_raw(src_meta.uid());
+        let gid = Gid::from_raw(src_meta.gid());
+        if let Err(e) = chown(dest, Some(uid), Some(gid)) {
+            return Err(format!("ownership: {}", e));
+        }
+    }
+
+    // --- Extended attributes (Unix only) ---
+    #[cfg(unix)]
+    {
+        for attr in xattr::list(src).map_err(|e| e.to_string())? {
+            if let Ok(Some(value)) = xattr::get(src, &attr) {
+                xattr::set(dest, &attr, &value).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+pub fn forensic_copy(
+    source: &str,
+    destination: &str,
+    algorithm: &HashingAlgorithm,
+    hash_mode: &HashMode,
+) -> Result<Vec<FileCopyResult>, ForensicError> {
+    let source_path = Path::new(source);
+    if !source_path.exists() || !source_path.is_dir() {
         return Err(ForensicError::DirectoryNotFound(source_path.display().to_string()));
     }
 
@@ -53,46 +183,105 @@ pub fn forensic_copy(source: &str, destination: &str, algorithm: &HashingAlgorit
         fs::create_dir_all(destination_path)
             .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
     }
+
     
-    let all_files = collect_files(&source_path)?;
+    let all_files = collect_files(source_path)?;
+
+    let multi = MultiProgress::new();
+
+    let overall_bar = multi.add(ProgressBar::new(all_files.len() as u64));
+    overall_bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta})"
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
     let results: Vec<Result<FileCopyResult, ForensicError>> = all_files
         .par_iter()
         .map(|file| {
             let start = Instant::now();
 
-            let relative = file.strip_prefix(source_path).map_err(|e| ForensicError::CopyError(e.to_string()))?;
+            let relative = file
+                .strip_prefix(source_path)
+                .map_err(|e| ForensicError::CopyError(e.to_string()))?;
             let dest_path = destination_path.join(relative);
 
             if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent).map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
+                fs::create_dir_all(parent)
+                    .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
             }
-       
-            let file_size = fs::metadata(file).map_err(|e| ForensicError::FileReadError(e.to_string()))?.len();
-            let src_hash = hash_file(file, algorithm)?;
+
+            let file_size = fs::metadata(file)
+                .map_err(|e| ForensicError::FileReadError(e.to_string()))?
+                .len();
+
+            // Show per-file progress bar for large files
+            let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
+                let bar = multi.add(ProgressBar::new(file_size));
+                bar.set_style(
+                    ProgressStyle::with_template(
+                        "  {spinner:.yellow} {wide_msg} [{bar:30.yellow/white}] {bytes}/{total_bytes} ({bytes_per_sec})"
+                    )
+                    .unwrap()
+                    .progress_chars("=>-"),
+                );
+                bar.set_message(
+                    file.file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                );
+                Some(bar)
+            } else {
+                None
+            };
+
+            // Hash source (unless --no-hash)
+            let src_hash = match hash_mode {
+                HashMode::NoHash => String::from("N/A"),
+                _ => hash_file_with_progress(file, algorithm, file_bar.as_ref())?,
+            };
+
             fs::copy(file, &dest_path)
                 .map_err(|e| ForensicError::CopyError(e.to_string()))?;
-            
-            let dest_hash = hash_file(&dest_path, algorithm)?;
-            let verified = src_hash == dest_hash;
+
+            // Preserve metadata (always-on)
+            let metadata_error = preserve_metadata(file, &dest_path).err();
+
+            // Hash dest and verify (unless --no-hash or --no-verify)
+            let (dest_hash, verified) = match hash_mode {
+                HashMode::Full => {
+                    let h = hash_file_with_progress(&dest_path, algorithm, file_bar.as_ref())?;
+                    let v = src_hash == h;
+                    (h, v)
+                }
+                HashMode::NoVerify => (String::from("N/A"), true),
+                HashMode::NoHash => (String::from("N/A"), true),
+            };
+
+            if let Some(bar) = file_bar {
+                bar.finish_and_clear();
+            }
+
+            overall_bar.inc(1);
             let copy_time_ms = start.elapsed().as_millis() as u64;
+
             Ok(FileCopyResult {
                 source_path: file.clone(),
                 dest_path,
                 file_size,
-                src_hash, 
+                src_hash,
                 dest_hash,
                 verified,
-                error: if verified { None } else {
-                    Some(String::from("Hash mismatch!"))
-                },
+                error: if verified { None } else { Some(String::from("Hash mismatch!")) },
                 copy_time_ms,
+                metadata_error,
             })
         })
         .collect();
-         
+
+    overall_bar.finish_with_message("Done!");
     results.into_iter().collect()
 }
-
-
-        
-    

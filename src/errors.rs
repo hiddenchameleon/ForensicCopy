@@ -28,4 +28,6 @@ pub enum ForensicError {
     // UnsupportedHashAlgorithm(String),
     // #[error("Thread error: {0}")]
     // ThreadError(String),
+    // #[error("Failed to perserve metadata: {0}")]
+    // MetadataError(String),
 }

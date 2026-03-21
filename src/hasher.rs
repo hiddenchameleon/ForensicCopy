@@ -4,14 +4,22 @@ use std::io::Read;
 use sha2::{Sha256, Digest};
 
 use crate::errors::ForensicError;
-
+use indicatif::ProgressBar;
 #[derive(Debug, Clone)]
 pub enum HashingAlgorithm {
     Sha256,
     Blake3,
 }
-
+#[allow(dead_code)]
 pub fn hash_file(path: &Path, algorithm: &HashingAlgorithm) -> Result<String, ForensicError> {
+    hash_file_with_progress(path, algorithm, None)
+}
+
+pub fn hash_file_with_progress(
+    path: &Path,
+    algorithm: &HashingAlgorithm,
+    progress: Option<&ProgressBar>,
+) -> Result<String, ForensicError> {
     let mut file = fs::File::open(path)
         .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
 
@@ -24,6 +32,9 @@ pub fn hash_file(path: &Path, algorithm: &HashingAlgorithm) -> Result<String, Fo
                     .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
                 if bytes_read == 0 { break; }
                 hasher.update(&buffer[..bytes_read]);
+                if let Some(pb) = progress {
+                    pb.inc(bytes_read as u64);
+                }
             }
             Ok(hex::encode(hasher.finalize()))
         }
@@ -34,8 +45,11 @@ pub fn hash_file(path: &Path, algorithm: &HashingAlgorithm) -> Result<String, Fo
                     .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
                 if bytes_read == 0 { break; }
                 hasher.update(&buffer[..bytes_read]);
+                if let Some(pb) = progress {
+                    pb.inc(bytes_read as u64);
+                }
             }
-            Ok(hasher.finalize().to_hex().to_string())       
+            Ok(hasher.finalize().to_hex().to_string())
         }
     }
 }
