@@ -3,6 +3,14 @@ name = "Forensic_Copy"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "forensic_copy"
+path = "src/main.rs"
+
+[lib]
+name = "forensic_copy"
+path = "src/lib.rs"
+
 [dependencies]
 sha2 = "0.10"
 digest = "0.10"
@@ -14,6 +22,8 @@ rayon = "1"
 filetime = "0.2"
 xattr = "1"
 indicatif = "0.17"
+serde = { version = "1", features = ["derive"] }
+
 
 [target.'cfg(unix)'.dependencies]
 xattr = "1"

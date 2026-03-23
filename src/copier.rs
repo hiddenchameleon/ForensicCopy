@@ -2,15 +2,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 use filetime::FileTime;
-use rayon::prelude::*;
 use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
-use crate::hasher::{hash_file_with_progress};
+use crate::hasher::hash_file_with_progress;
 use crate::HashMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 
-const LARGE_FILE_THRESHOLD: u64 = 100 *1024 * 1024;
+const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct FileCopyResult {
@@ -28,10 +27,30 @@ pub struct FileCopyResult {
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
     let mut files = Vec::new();
     let mut seen = HashSet::new();
-
     collect_files_inner(dir, &mut files, &mut seen)?;
     Ok(files)
 }
+
+pub fn collect_dirs(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
+    let mut dirs = Vec::new();
+    collect_dirs_inner(dir, &mut dirs)?;
+    Ok(dirs)
+}
+
+fn collect_dirs_inner(dir: &Path, dirs: &mut Vec<PathBuf>) -> Result<(), ForensicError> {
+    let entries = fs::read_dir(dir)
+        .map_err(|e| ForensicError::DirectoryNotReadable(e.to_string()))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| ForensicError::DirectoryNotReadable(e.to_string()))?;
+        let path = entry.path();
+        if path.is_dir() {
+            dirs.push(path.clone());
+            collect_dirs_inner(&path, dirs)?;
+        }
+    }
+    Ok(())
+}
+
 fn collect_files_inner(
     dir: &Path,
     files: &mut Vec<PathBuf>,
@@ -39,11 +58,9 @@ fn collect_files_inner(
 ) -> Result<(), ForensicError> {
     let entries = fs::read_dir(dir)
         .map_err(|e| ForensicError::DirectoryNotReadable(e.to_string()))?;
-
     for entry in entries {
         let entry = entry.map_err(|e| ForensicError::DirectoryNotReadable(e.to_string()))?;
         let path = entry.path();
-
         if path.is_dir() {
             collect_files_inner(&path, files, seen)?;
         } else {
@@ -51,7 +68,6 @@ fn collect_files_inner(
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             if !file_name.starts_with("._") {
-                // Use canonicalize to resolve any symlinks before deduplication
                 let canonical = fs::canonicalize(&path)
                     .unwrap_or_else(|_| path.clone());
                 if seen.insert(canonical) {
@@ -62,15 +78,14 @@ fn collect_files_inner(
     }
     Ok(())
 }
+
 fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     let src_meta = fs::metadata(src).map_err(|e| e.to_string())?;
 
-    // --- Timestamps (atime + mtime, cross-platform) ---
     let atime = FileTime::from_last_access_time(&src_meta);
     let mtime = FileTime::from_last_modification_time(&src_meta);
     filetime::set_file_times(dest, atime, mtime).map_err(|e| e.to_string())?;
 
-    // --- Birthtime (Windows) ---
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -98,7 +113,6 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
-    // --- Birthtime (macOS) ---
     #[cfg(target_os = "macos")]
     {
         use libc::{attrlist, setattrlist, ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME};
@@ -142,20 +156,17 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
-    // --- Birthtime (Linux) --- not supported, log as warning
     #[cfg(all(unix, not(target_os = "macos")))]
     {
         return Err(String::from("birthtime preservation not supported on Linux"));
     }
 
-    // --- Permissions (Unix only) ---
     #[cfg(unix)]
     {
         let permissions = src_meta.permissions();
         fs::set_permissions(dest, permissions).map_err(|e| e.to_string())?;
     }
 
-    // --- Ownership (Unix only, best-effort) ---
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -167,7 +178,6 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
         }
     }
 
-    // --- Extended attributes (Unix only) ---
     #[cfg(unix)]
     {
         for attr in xattr::list(src).map_err(|e| e.to_string())? {
@@ -180,12 +190,16 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-pub fn forensic_copy(
+pub fn forensic_copy<F>(
     source: &str,
     destination: &str,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
-) -> Result<Vec<FileCopyResult>, ForensicError> {
+    progress_callback: F,
+) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>), ForensicError>
+where
+    F: Fn(u64, u64, &str) + Send + Sync,
+{
     let source_path = Path::new(source);
     if !source_path.exists() || !source_path.is_dir() {
         return Err(ForensicError::DirectoryNotFound(source_path.display().to_string()));
@@ -197,104 +211,134 @@ pub fn forensic_copy(
             .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
     }
 
-    
     let all_files = collect_files(source_path)?;
+    let total = all_files.len() as u64;
 
+    // let multi = MultiProgress::new();
+    // let overall_bar = multi.add(ProgressBar::new(total));
+    // overall_bar.set_style(
+    //     ProgressStyle::with_template(
+    //         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta})"
+    //     )
+    //     .unwrap()
+    //     .progress_chars("=>-"),
+    // );
     let multi = MultiProgress::new();
+    let overall_bar = multi.add(ProgressBar::hidden());
 
-    let overall_bar = multi.add(ProgressBar::new(all_files.len() as u64));
-    overall_bar.set_style(
-        ProgressStyle::with_template(
-            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta})"
-        )
-        .unwrap()
-        .progress_chars("=>-"),
-    );
+    let mut file_results: Vec<FileCopyResult> = Vec::new();
 
-    let results: Vec<Result<FileCopyResult, ForensicError>> = all_files
-        .par_iter()
-        .map(|file| {
-            let start = Instant::now();
+    for (i, file) in all_files.iter().enumerate() {
+        let start = Instant::now();
 
-            let relative = file
-                .strip_prefix(source_path)
-                .map_err(|e| ForensicError::CopyError(e.to_string()))?;
-            let dest_path = destination_path.join(relative);
+        let relative = file
+            .strip_prefix(source_path)
+            .map_err(|e| ForensicError::CopyError(e.to_string()))?;
+        let dest_path = destination_path.join(relative);
 
-            if let Some(parent) = dest_path.parent() {
-                fs::create_dir_all(parent)
-                    .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
+        if let Some(parent) = dest_path.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
+        }
+
+        let file_size = fs::metadata(file)
+            .map_err(|e| ForensicError::FileReadError(e.to_string()))?
+            .len();
+
+        let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
+            let bar = multi.add(ProgressBar::new(file_size));
+            bar.set_style(
+                ProgressStyle::with_template(
+                    "  {spinner:.yellow} {wide_msg} [{bar:30.yellow/white}] {bytes}/{total_bytes} ({bytes_per_sec})"
+                )
+                .unwrap()
+                .progress_chars("=>-"),
+            );
+            bar.set_message(
+                file.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string()
+            );
+            Some(bar)
+        } else {
+            None
+        };
+
+        let src_hash = match hash_mode {
+            HashMode::NoHash => String::from("N/A"),
+            _ => hash_file_with_progress(file, algorithm, file_bar.as_ref())?,
+        };
+
+        fs::copy(file, &dest_path)
+            .map_err(|e| ForensicError::CopyError(e.to_string()))?;
+
+        let metadata_error = preserve_metadata(file, &dest_path).err();
+
+        let (dest_hash, verified) = match hash_mode {
+            HashMode::Full => {
+                let h = hash_file_with_progress(&dest_path, algorithm, file_bar.as_ref())?;
+                let v = src_hash == h;
+                (h, v)
             }
+            HashMode::NoVerify => (String::from("N/A"), true),
+            HashMode::NoHash => (String::from("N/A"), true),
+        };
 
-            let file_size = fs::metadata(file)
-                .map_err(|e| ForensicError::FileReadError(e.to_string()))?
-                .len();
+        if let Some(bar) = file_bar {
+            bar.finish_and_clear();
+        }
 
-            // Show per-file progress bar for large files
-            let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
-                let bar = multi.add(ProgressBar::new(file_size));
-                bar.set_style(
-                    ProgressStyle::with_template(
-                        "  {spinner:.yellow} {wide_msg} [{bar:30.yellow/white}] {bytes}/{total_bytes} ({bytes_per_sec})"
-                    )
-                    .unwrap()
-                    .progress_chars("=>-"),
-                );
-                bar.set_message(
-                    file.file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                );
-                Some(bar)
-            } else {
-                None
-            };
+        overall_bar.inc(1);
+        let copy_time_ms = start.elapsed().as_millis() as u64;
 
-            // Hash source (unless --no-hash)
-            let src_hash = match hash_mode {
-                HashMode::NoHash => String::from("N/A"),
-                _ => hash_file_with_progress(file, algorithm, file_bar.as_ref())?,
-            };
+        // Fire progress callback
+        let filename = file.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        progress_callback(i as u64 + 1, total, &filename);
 
-            fs::copy(file, &dest_path)
-                .map_err(|e| ForensicError::CopyError(e.to_string()))?;
+        file_results.push(FileCopyResult {
+            source_path: file.clone(),
+            dest_path,
+            file_size,
+            src_hash,
+            dest_hash,
+            verified,
+            error: if verified { None } else { Some(String::from("Hash mismatch!")) },
+            copy_time_ms,
+            metadata_error,
+        });
+    }
 
-            // Preserve metadata (always-on)
-            let metadata_error = preserve_metadata(file, &dest_path).err();
+    // overall_bar.finish_with_message("Done!");
+    overall_bar.finish_and_clear();
+    // Preserve directory metadata deepest-first
+    let mut all_dirs = collect_dirs(source_path)?;
+    all_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
 
-            // Hash dest and verify (unless --no-hash or --no-verify)
-            let (dest_hash, verified) = match hash_mode {
-                HashMode::Full => {
-                    let h = hash_file_with_progress(&dest_path, algorithm, file_bar.as_ref())?;
-                    let v = src_hash == h;
-                    (h, v)
-                }
-                HashMode::NoVerify => (String::from("N/A"), true),
-                HashMode::NoHash => (String::from("N/A"), true),
-            };
+    let mut dir_metadata_errors: Vec<(PathBuf, String)> = Vec::new();
 
-            if let Some(bar) = file_bar {
-                bar.finish_and_clear();
+    for src_dir in &all_dirs {
+        let relative = match src_dir.strip_prefix(source_path) {
+            Ok(r) => r,
+            Err(e) => {
+                dir_metadata_errors.push((src_dir.clone(), e.to_string()));
+                continue;
             }
+        };
+        let dest_dir = destination_path.join(relative);
+        if dest_dir.exists() {
+            if let Err(e) = preserve_metadata(src_dir, &dest_dir) {
+                dir_metadata_errors.push((src_dir.clone(), e));
+            }
+        }
+    }
 
-            overall_bar.inc(1);
-            let copy_time_ms = start.elapsed().as_millis() as u64;
+    if let Err(e) = preserve_metadata(source_path, destination_path) {
+        dir_metadata_errors.push((source_path.to_path_buf(), e));
+    }
 
-            Ok(FileCopyResult {
-                source_path: file.clone(),
-                dest_path,
-                file_size,
-                src_hash,
-                dest_hash,
-                verified,
-                error: if verified { None } else { Some(String::from("Hash mismatch!")) },
-                copy_time_ms,
-                metadata_error,
-            })
-        })
-        .collect();
-
-    overall_bar.finish_with_message("Done!");
-    results.into_iter().collect()
+    Ok((file_results, dir_metadata_errors))
 }

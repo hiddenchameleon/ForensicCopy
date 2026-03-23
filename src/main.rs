@@ -1,18 +1,7 @@
-mod errors;
-mod hasher;
-mod copier;
-mod report;
-
 use std::time::Instant;
 use std::path::PathBuf;
-use hasher::HashingAlgorithm;
 use report::ReportConfig;
-
-pub enum HashMode {
-    Full,
-    NoVerify,
-    NoHash,
-}
+use forensic_copy::{HashMode, hasher::HashingAlgorithm, copier, report};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -72,15 +61,17 @@ fn main() {
     
     let start = Instant::now();
 
-    match copier::forensic_copy(source, destination, &hashing_algorithm, &hash_mode ){
-        Ok(results) => {
+    match copier::forensic_copy(source, destination, &hashing_algorithm, &hash_mode, |done, total, filename| {
+        println!("Progress: {}/{} - {}", done, total, filename);
+    }) {
+        Ok((results, dir_errors)) => {
             let total_time_ms = start.elapsed().as_millis() as u64;
             let verified = results.iter().filter(|r| r.verified).count();
             let failed = results.len() - verified;
             let meta_warnings = results.iter().filter(|r| r.metadata_error.is_some()).count();
             println!("Copied {} files in {}", results.len(), report::format_duration(total_time_ms));
-            println!("Verified: {} Failed: {} Metadata warnings: {}", verified, failed, meta_warnings);
-            match report::generate_report(&results, source, destination, &hashing_algorithm, &hash_mode,total_time_ms, &report_config) {
+            println!("Verified: {} Failed: {} Metadata warnings: {} Dir metadata warnings: {}", verified, failed, meta_warnings, dir_errors.len());
+            match report::generate_report(&results, source, destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config) {
                 Err(e) => println!("Error: {}", e),
                 Ok(()) => println!("Report generated successfully!"),
             };
