@@ -10,6 +10,8 @@ use crate::hasher::{hash_file_with_progress, copy_and_hash};
 use crate::HashMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
+#[cfg(windows)]
+use std::os::windows::fs::MetadataExt;
 
 const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
 
@@ -107,7 +109,7 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
             .open(dest)
             .map_err(|e| format!("birthtime open: {}", e))?;
 
-        let handle = HANDLE(file.as_raw_handle() as isize);
+        let handle = HANDLE(file.as_raw_handle() as *mut std::ffi::c_void);
 
         unsafe {
             SetFileTime(handle, Some(&creation_ft), None, None)
