@@ -288,8 +288,21 @@ where
     })
 }
 
+/// Entry describing a single file to copy, carrying the base paths needed to
+/// reconstruct the relative destination path.
+struct CopyEntry {
+    /// Absolute path to the file on disk.
+    file: PathBuf,
+    /// The "root" path this file's relative path should be computed from.
+    strip_base: PathBuf,
+    /// Prefix prepended to the relative path inside the destination.
+    /// For directory sources this is the directory's name; for individual
+    /// files this is empty (file lands directly in the destination root).
+    dest_prefix: PathBuf,
+}
+
 pub fn forensic_copy<F>(
-    source: &str,
+    sources: &[PathBuf],
     destination: &str,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
@@ -298,9 +311,8 @@ pub fn forensic_copy<F>(
 where
     F: Fn(u64, u64, &str) + Send + Sync,
 {
-    let source_path = Path::new(source);
-    if !source_path.exists() || !source_path.is_dir() {
-        return Err(ForensicError::DirectoryNotFound(source_path.display().to_string()));
+    if sources.is_empty() {
+        return Err(ForensicError::DirectoryNotFound("no sources provided".to_string()));
     }
 
     let destination_path = Path::new(destination);
@@ -309,13 +321,49 @@ where
             .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
     }
 
-    let all_files = collect_files(source_path)?;
-    let total = all_files.len() as u64;
+    // Build a flat list of files to copy, each annotated with how to place it
+    // inside the destination.
+    let mut entries: Vec<CopyEntry> = Vec::new();
+    // Track (source_path, dest_prefix) pairs for directory metadata preservation.
+    let mut dir_sources: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+    for src in sources {
+        if !src.exists() {
+            return Err(ForensicError::DirectoryNotFound(src.display().to_string()));
+        }
+
+        if src.is_dir() {
+            let dir_name = src.file_name()
+                .ok_or_else(|| ForensicError::DirectoryNotFound(src.display().to_string()))?;
+            let dest_prefix = PathBuf::from(dir_name);
+
+            let files = collect_files(src)?;
+            for f in files {
+                entries.push(CopyEntry {
+                    file: f,
+                    strip_base: src.clone(),
+                    dest_prefix: dest_prefix.clone(),
+                });
+            }
+            dir_sources.push((src.clone(), dest_prefix));
+        } else {
+            // Individual file — lands directly in the destination root.
+            let parent = src.parent()
+                .ok_or_else(|| ForensicError::FileReadError(format!("cannot determine parent of {}", src.display())))?;
+            entries.push(CopyEntry {
+                file: src.clone(),
+                strip_base: parent.to_path_buf(),
+                dest_prefix: PathBuf::new(),
+            });
+        }
+    }
+
+    let total = entries.len() as u64;
 
     // Pre-create all destination directories so parallel copies don't race.
-    for file in &all_files {
-        if let Ok(relative) = file.strip_prefix(source_path) {
-            let dest_path = destination_path.join(relative);
+    for entry in &entries {
+        if let Ok(relative) = entry.file.strip_prefix(&entry.strip_base) {
+            let dest_path = destination_path.join(&entry.dest_prefix).join(relative);
             if let Some(parent) = dest_path.parent() {
                 fs::create_dir_all(parent)
                     .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
@@ -337,10 +385,9 @@ where
     let next_index = AtomicU64::new(0);
     let completed = AtomicU64::new(0);
 
-
     // Pre-allocate results with None slots; threads fill them by index.
     let results_slots: Vec<std::sync::Mutex<Option<FileCopyResult>>> =
-        (0..all_files.len()).map(|_| std::sync::Mutex::new(None)).collect();
+        (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();
     let first_error: std::sync::Mutex<Option<ForensicError>> = std::sync::Mutex::new(None);
 
     let num_threads = rayon::current_num_threads();
@@ -348,19 +395,19 @@ where
         for _ in 0..num_threads {
             s.spawn(|_| {
                 loop {
-                    // Check if another thread hit an error.
                     if first_error.lock().unwrap().is_some() {
                         return;
                     }
 
                     let idx = next_index.fetch_add(1, Ordering::Relaxed) as usize;
-                    if idx >= all_files.len() {
+                    if idx >= entries.len() {
                         return;
                     }
 
-                    let file = &all_files[idx];
+                    let entry = &entries[idx];
+                    let effective_dest = destination_path.join(&entry.dest_prefix);
                     let result = process_file(
-                        file, source_path, destination_path,
+                        &entry.file, &entry.strip_base, &effective_dest,
                         algorithm, hash_mode, &multi, &overall_bar,
                         &completed, total, &progress_callback,
                     );
@@ -381,7 +428,6 @@ where
 
     overall_bar.finish_with_message("Done!");
 
-    // If any thread encountered an error, propagate it.
     if let Some(e) = first_error.into_inner().unwrap() {
         return Err(e);
     }
@@ -390,30 +436,37 @@ where
         .into_iter()
         .map(|slot| slot.into_inner().unwrap().unwrap())
         .collect();
-    // Preserve directory metadata deepest-first
-    let mut all_dirs = collect_dirs(source_path)?;
-    all_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
 
+    // Preserve directory metadata deepest-first for each directory source.
     let mut dir_metadata_errors: Vec<(PathBuf, String)> = Vec::new();
 
-    for src_dir in &all_dirs {
-        let relative = match src_dir.strip_prefix(source_path) {
-            Ok(r) => r,
-            Err(e) => {
-                dir_metadata_errors.push((src_dir.clone(), e.to_string()));
-                continue;
-            }
-        };
-        let dest_dir = destination_path.join(relative);
-        if dest_dir.exists() {
-            if let Err(e) = preserve_metadata(src_dir, &dest_dir) {
-                dir_metadata_errors.push((src_dir.clone(), e));
+    for (source_path, dest_prefix) in &dir_sources {
+        let effective_dest = destination_path.join(dest_prefix);
+
+        let mut all_dirs = collect_dirs(source_path)?;
+        all_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));
+
+        for src_dir in &all_dirs {
+            let relative = match src_dir.strip_prefix(source_path) {
+                Ok(r) => r,
+                Err(e) => {
+                    dir_metadata_errors.push((src_dir.clone(), e.to_string()));
+                    continue;
+                }
+            };
+            let dest_dir = effective_dest.join(relative);
+            if dest_dir.exists() {
+                if let Err(e) = preserve_metadata(src_dir, &dest_dir) {
+                    dir_metadata_errors.push((src_dir.clone(), e));
+                }
             }
         }
-    }
 
-    if let Err(e) = preserve_metadata(source_path, destination_path) {
-        dir_metadata_errors.push((source_path.to_path_buf(), e));
+        if effective_dest.exists() {
+            if let Err(e) = preserve_metadata(source_path, &effective_dest) {
+                dir_metadata_errors.push((source_path.clone(), e));
+            }
+        }
     }
 
     Ok((file_results, dir_metadata_errors))

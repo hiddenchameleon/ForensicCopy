@@ -14,7 +14,7 @@ pub struct ReportConfig {
 
 pub fn generate_report(
     results: &[FileCopyResult],
-    source: &str,
+    sources: &[String],
     destination: &str,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
@@ -53,7 +53,14 @@ pub fn generate_report(
     let avg_time_ms = if total_files > 0 { total_time_ms / total_files as u64 } else { 0 };
 
     report.push_str("----------------------------------------------------------\n");
-    report.push_str(&format!("Source:             {}\n", source));
+    if sources.len() == 1 {
+        report.push_str(&format!("Source:             {}\n", sources[0]));
+    } else {
+        report.push_str(&format!("Sources ({}):\n", sources.len()));
+        for src in sources {
+            report.push_str(&format!("  - {}\n", src));
+        }
+    }
     report.push_str(&format!("Destination:        {}\n", destination));
     report.push_str(&format!("Total Files:        {}\n", total_files));
     report.push_str(&format!("Total Size:         {}\n", format_size(total_size)));
