@@ -1,10 +1,12 @@
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 use filetime::FileTime;
+use rayon;
 use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
-use crate::hasher::hash_file_with_progress;
+use crate::hasher::{hash_file_with_progress, copy_and_hash};
 use crate::HashMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
@@ -190,6 +192,102 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
+fn process_file<F>(
+    file: &Path,
+    source_path: &Path,
+    destination_path: &Path,
+    algorithm: &HashingAlgorithm,
+    hash_mode: &HashMode,
+    multi: &MultiProgress,
+    overall_bar: &ProgressBar,
+    completed: &AtomicU64,
+    total: u64,
+    progress_callback: &F,
+) -> Result<FileCopyResult, ForensicError>
+where
+    F: Fn(u64, u64, &str) + Send + Sync,
+{
+    let start = Instant::now();
+
+    let relative = file
+        .strip_prefix(source_path)
+        .map_err(|e| ForensicError::CopyError(e.to_string()))?;
+    let dest_path = destination_path.join(relative);
+
+    let file_size = fs::metadata(file)
+        .map_err(|e| ForensicError::FileReadError(e.to_string()))?
+        .len();
+
+    let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
+        let bar = multi.add(ProgressBar::new(file_size));
+        bar.set_style(
+            ProgressStyle::with_template(
+                "  {spinner:.yellow} {wide_msg} [{bar:30.yellow/white}] {bytes}/{total_bytes} ({bytes_per_sec})"
+            )
+            .unwrap()
+            .progress_chars("=>-"),
+        );
+        bar.set_message(
+            file.file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string()
+        );
+        Some(bar)
+    } else {
+        None
+    };
+
+    // Single-pass copy+hash avoids reading the source file twice.
+    let src_hash = match hash_mode {
+        HashMode::NoHash => {
+            fs::copy(file, &dest_path)
+                .map_err(|e| ForensicError::CopyError(e.to_string()))?;
+            String::from("N/A")
+        }
+        _ => copy_and_hash(file, &dest_path, algorithm, file_bar.as_ref())?,
+    };
+
+    let metadata_error = preserve_metadata(file, &dest_path).err();
+
+    let (dest_hash, verified) = match hash_mode {
+        HashMode::Full => {
+            let h = hash_file_with_progress(&dest_path, algorithm, file_bar.as_ref())?;
+            let v = src_hash == h;
+            (h, v)
+        }
+        HashMode::NoVerify => (String::from("N/A"), true),
+        HashMode::NoHash => (String::from("N/A"), true),
+    };
+
+    if let Some(bar) = file_bar {
+        bar.finish_and_clear();
+    }
+
+    overall_bar.inc(1);
+    let copy_time_ms = start.elapsed().as_millis() as u64;
+
+    let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+    let filename = file.file_name()
+        .unwrap_or_default()
+        .to_string_lossy()
+        .to_string();
+    multi.println(format!("Progress: {}/{} - {}", done, total, &filename)).ok();
+    progress_callback(done, total, &filename);
+
+    Ok(FileCopyResult {
+        source_path: file.to_path_buf(),
+        dest_path,
+        file_size,
+        src_hash,
+        dest_hash,
+        verified,
+        error: if verified { None } else { Some(String::from("Hash mismatch!")) },
+        copy_time_ms,
+        metadata_error,
+    })
+}
+
 pub fn forensic_copy<F>(
     source: &str,
     destination: &str,
@@ -214,106 +312,84 @@ where
     let all_files = collect_files(source_path)?;
     let total = all_files.len() as u64;
 
-    // let multi = MultiProgress::new();
-    // let overall_bar = multi.add(ProgressBar::new(total));
-    // overall_bar.set_style(
-    //     ProgressStyle::with_template(
-    //         "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta})"
-    //     )
-    //     .unwrap()
-    //     .progress_chars("=>-"),
-    // );
-    let multi = MultiProgress::new();
-    let overall_bar = multi.add(ProgressBar::hidden());
-
-    let mut file_results: Vec<FileCopyResult> = Vec::new();
-
-    for (i, file) in all_files.iter().enumerate() {
-        let start = Instant::now();
-
-        let relative = file
-            .strip_prefix(source_path)
-            .map_err(|e| ForensicError::CopyError(e.to_string()))?;
-        let dest_path = destination_path.join(relative);
-
-        if let Some(parent) = dest_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
-        }
-
-        let file_size = fs::metadata(file)
-            .map_err(|e| ForensicError::FileReadError(e.to_string()))?
-            .len();
-
-        let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
-            let bar = multi.add(ProgressBar::new(file_size));
-            bar.set_style(
-                ProgressStyle::with_template(
-                    "  {spinner:.yellow} {wide_msg} [{bar:30.yellow/white}] {bytes}/{total_bytes} ({bytes_per_sec})"
-                )
-                .unwrap()
-                .progress_chars("=>-"),
-            );
-            bar.set_message(
-                file.file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string()
-            );
-            Some(bar)
-        } else {
-            None
-        };
-
-        let src_hash = match hash_mode {
-            HashMode::NoHash => String::from("N/A"),
-            _ => hash_file_with_progress(file, algorithm, file_bar.as_ref())?,
-        };
-
-        fs::copy(file, &dest_path)
-            .map_err(|e| ForensicError::CopyError(e.to_string()))?;
-
-        let metadata_error = preserve_metadata(file, &dest_path).err();
-
-        let (dest_hash, verified) = match hash_mode {
-            HashMode::Full => {
-                let h = hash_file_with_progress(&dest_path, algorithm, file_bar.as_ref())?;
-                let v = src_hash == h;
-                (h, v)
+    // Pre-create all destination directories so parallel copies don't race.
+    for file in &all_files {
+        if let Ok(relative) = file.strip_prefix(source_path) {
+            let dest_path = destination_path.join(relative);
+            if let Some(parent) = dest_path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|e| ForensicError::CreateDirectoryFailed(e.to_string()))?;
             }
-            HashMode::NoVerify => (String::from("N/A"), true),
-            HashMode::NoHash => (String::from("N/A"), true),
-        };
-
-        if let Some(bar) = file_bar {
-            bar.finish_and_clear();
         }
-
-        overall_bar.inc(1);
-        let copy_time_ms = start.elapsed().as_millis() as u64;
-
-        // Fire progress callback
-        let filename = file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        progress_callback(i as u64 + 1, total, &filename);
-
-        file_results.push(FileCopyResult {
-            source_path: file.clone(),
-            dest_path,
-            file_size,
-            src_hash,
-            dest_hash,
-            verified,
-            error: if verified { None } else { Some(String::from("Hash mismatch!")) },
-            copy_time_ms,
-            metadata_error,
-        });
     }
 
-    // overall_bar.finish_with_message("Done!");
-    overall_bar.finish_and_clear();
+    let multi = MultiProgress::new();
+    let overall_bar = multi.add(ProgressBar::new(total));
+    overall_bar.set_style(
+        ProgressStyle::with_template(
+            "{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} files ({eta})"
+        )
+        .unwrap()
+        .progress_chars("=>-"),
+    );
+
+    // Shared work queue: each thread atomically grabs the next file index.
+    let next_index = AtomicU64::new(0);
+    let completed = AtomicU64::new(0);
+
+
+    // Pre-allocate results with None slots; threads fill them by index.
+    let results_slots: Vec<std::sync::Mutex<Option<FileCopyResult>>> =
+        (0..all_files.len()).map(|_| std::sync::Mutex::new(None)).collect();
+    let first_error: std::sync::Mutex<Option<ForensicError>> = std::sync::Mutex::new(None);
+
+    let num_threads = rayon::current_num_threads();
+    rayon::scope(|s| {
+        for _ in 0..num_threads {
+            s.spawn(|_| {
+                loop {
+                    // Check if another thread hit an error.
+                    if first_error.lock().unwrap().is_some() {
+                        return;
+                    }
+
+                    let idx = next_index.fetch_add(1, Ordering::Relaxed) as usize;
+                    if idx >= all_files.len() {
+                        return;
+                    }
+
+                    let file = &all_files[idx];
+                    let result = process_file(
+                        file, source_path, destination_path,
+                        algorithm, hash_mode, &multi, &overall_bar,
+                        &completed, total, &progress_callback,
+                    );
+
+                    match result {
+                        Ok(r) => {
+                            *results_slots[idx].lock().unwrap() = Some(r);
+                        }
+                        Err(e) => {
+                            *first_error.lock().unwrap() = Some(e);
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    overall_bar.finish_with_message("Done!");
+
+    // If any thread encountered an error, propagate it.
+    if let Some(e) = first_error.into_inner().unwrap() {
+        return Err(e);
+    }
+
+    let file_results: Vec<FileCopyResult> = results_slots
+        .into_iter()
+        .map(|slot| slot.into_inner().unwrap().unwrap())
+        .collect();
     // Preserve directory metadata deepest-first
     let mut all_dirs = collect_dirs(source_path)?;
     all_dirs.sort_by(|a, b| b.components().count().cmp(&a.components().count()));

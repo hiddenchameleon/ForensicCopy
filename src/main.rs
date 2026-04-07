@@ -7,7 +7,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     
     if args.len() < 3 {
-        println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3] [--no-hash] [--no-verify] [--report] [--report-path <path>]");
+        println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report] [--report-path <path>]");
         return;
     }
 
@@ -33,8 +33,9 @@ fn main() {
         hashing_algorithm = match hashing.as_str() {
             "sha256"        => HashingAlgorithm::Sha256,
             "blake3"        => HashingAlgorithm::Blake3,
+            "md5"           => HashingAlgorithm::Md5,
             _               => {
-                println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3] [--no-hash] [--no-verify] [--report] [--report_path <path>]");
+                println!("Usage: Forensic_copy <source> <destination> [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report] [--report_path <path>]");
                 return;
                 },
         };
@@ -61,8 +62,9 @@ fn main() {
     
     let start = Instant::now();
 
-    match copier::forensic_copy(source, destination, &hashing_algorithm, &hash_mode, |done, total, filename| {
-        println!("Progress: {}/{} - {}", done, total, filename);
+    match copier::forensic_copy(source, destination, &hashing_algorithm, &hash_mode, |_done, _total, _filename| {
+        // Progress is now printed by forensic_copy via indicatif.
+        // This callback remains available for GUI consumers.
     }) {
         Ok((results, dir_errors)) => {
             let total_time_ms = start.elapsed().as_millis() as u64;

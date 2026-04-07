@@ -36,6 +36,7 @@ pub fn generate_report(
     let algo_name = match algorithm {
         HashingAlgorithm::Sha256 => "SHA256",
         HashingAlgorithm::Blake3 => "BLAKE3",
+        HashingAlgorithm::Md5    => "MD5",
     };
     let hash_mode_str = match hash_mode {
         HashMode::Full     => format!("{} (full verify)", algo_name),
