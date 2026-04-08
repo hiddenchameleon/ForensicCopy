@@ -23,6 +23,7 @@ rayon = "1"
 filetime = "0.2"
 indicatif = "0.17"
 serde = { version = "1", features = ["derive"] }
+csv = "1"
 
 
 [target.'cfg(unix)'.dependencies]

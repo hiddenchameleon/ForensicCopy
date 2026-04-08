@@ -8,6 +8,7 @@ use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
 use crate::hasher::{hash_file_with_progress, copy_and_hash};
 use crate::{HashMode, ConflictMode};
+use crate::icloud::ICloudMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 #[cfg(windows)]
@@ -28,6 +29,12 @@ pub struct FileCopyResult {
     pub error: Option<String>,
     pub copy_time_ms: u64,
     pub metadata_error: Option<String>,
+    // iCloud Production fields
+    pub apple_hash: Option<String>,
+    pub src_matches_apple: Option<bool>,
+    pub dest_matches_apple: Option<bool>,
+    pub full_chain_verified: Option<bool>,
+    pub apple_hash_missing: bool,
 }
 
 pub fn collect_files(dir: &Path) -> Result<Vec<PathBuf>, ForensicError> {
@@ -212,6 +219,7 @@ fn process_file<F>(
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
     conflict_mode: &ConflictMode,
+    icloud_mode: Option<&ICloudMode>,
     multi: &MultiProgress,
     overall_bar: &ProgressBar,
     completed: &AtomicU64,
@@ -255,6 +263,11 @@ where
             error: None,
             copy_time_ms: 0,
             metadata_error: None,
+            apple_hash: None,
+            src_matches_apple: None,
+            dest_matches_apple: None,
+            full_chain_verified: None,
+            apple_hash_missing: false,
         });
     }
     // Overwrite mode falls through to normal copy; Abort is handled before the parallel loop.
@@ -316,6 +329,25 @@ where
     multi.println(format!("Progress: {}/{} - {}", done, total, &filename)).ok();
     progress_callback(done, total, &filename);
 
+    // iCloud three-way hash comparison
+    let (apple_hash, src_matches_apple, dest_matches_apple, full_chain_verified, apple_hash_missing) =
+        if let Some(icloud) = icloud_mode {
+            let filename = file.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(apple) = icloud.hash_map.get(&filename) {
+                let src_ok = src_hash == *apple;
+                let dest_ok = dest_hash == *apple;
+                let chain = src_ok && dest_ok && src_hash == dest_hash;
+                (Some(apple.clone()), Some(src_ok), Some(dest_ok), Some(chain), false)
+            } else {
+                (None, None, None, None, true)
+            }
+        } else {
+            (None, None, None, None, false)
+        };
+
     Ok(FileCopyResult {
         source_path: file.to_path_buf(),
         dest_path,
@@ -328,6 +360,11 @@ where
         error: if verified { None } else { Some(String::from("Hash mismatch!")) },
         copy_time_ms,
         metadata_error,
+        apple_hash,
+        src_matches_apple,
+        dest_matches_apple,
+        full_chain_verified,
+        apple_hash_missing,
     })
 }
 
@@ -350,13 +387,28 @@ pub fn forensic_copy<F>(
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
     conflict_mode: &ConflictMode,
+    icloud_mode: Option<&ICloudMode>,
     progress_callback: F,
-) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>), ForensicError>
+) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>, Vec<(String, String)>), ForensicError>
 where
     F: Fn(u64, u64, &str) + Send + Sync,
 {
     if sources.is_empty() {
         return Err(ForensicError::DirectoryNotFound("no sources provided".to_string()));
+    }
+
+    // iCloud mode enforcement
+    if let Some(_icloud) = icloud_mode {
+        if !matches!(algorithm, HashingAlgorithm::Sha256) {
+            return Err(ForensicError::CopyError(
+                "iCloud Production mode requires SHA256 hashing algorithm".to_string(),
+            ));
+        }
+        if !matches!(hash_mode, HashMode::Full) {
+            return Err(ForensicError::CopyError(
+                "iCloud Production mode requires Full hash mode (no --no-hash or --no-verify)".to_string(),
+            ));
+        }
     }
 
     let destination_path = Path::new(destination);
@@ -469,8 +521,8 @@ where
                     let effective_dest = destination_path.join(&entry.dest_prefix);
                     let result = process_file(
                         &entry.file, &entry.strip_base, &effective_dest,
-                        algorithm, hash_mode, conflict_mode, &multi, &overall_bar,
-                        &completed, total, &progress_callback,
+                        algorithm, hash_mode, conflict_mode, icloud_mode, &multi,
+                        &overall_bar, &completed, total, &progress_callback,
                     );
 
                     match result {
@@ -530,5 +582,23 @@ where
         }
     }
 
-    Ok((file_results, dir_metadata_errors))
+    // Collect files listed in Apple CSV but not found on disk
+    let missing_from_disk: Vec<(String, String)> = if let Some(icloud) = icloud_mode {
+        let copied_filenames: HashSet<String> = file_results.iter()
+            .filter_map(|r| {
+                r.source_path.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|s| s.to_string())
+            })
+            .collect();
+
+        icloud.hash_map.iter()
+            .filter(|(name, _)| !copied_filenames.contains(name.as_str()))
+            .map(|(name, hash)| (name.clone(), hash.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    Ok((file_results, dir_metadata_errors, missing_from_disk))
 }

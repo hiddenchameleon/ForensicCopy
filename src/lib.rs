@@ -2,6 +2,7 @@ pub mod errors;
 pub mod hasher;
 pub mod copier;
 pub mod report;
+pub mod icloud;
 
 use serde::{Deserialize, Serialize};
 

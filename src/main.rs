@@ -2,6 +2,7 @@ use std::time::Instant;
 use std::path::PathBuf;
 use report::ReportConfig;
 use forensic_copy::{HashMode, ConflictMode, hasher::HashingAlgorithm, copier, report};
+use forensic_copy::icloud::{ICloudMode, find_production_csv, parse_production_csv};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -11,6 +12,7 @@ fn main() {
         println!("       forensic_copy <source> <destination>");
         println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
         println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
+        println!("           [--icloud] [--icloud-csv <path>]");
         return;
     }
 
@@ -21,7 +23,9 @@ fn main() {
         return;
     }
 
-    let hash_mode = if no_hash {
+    let icloud_enabled = args.contains(&String::from("--icloud"));
+
+    let mut hash_mode = if no_hash {
         HashMode::NoHash
     } else if no_verify {
         HashMode::NoVerify
@@ -41,10 +45,17 @@ fn main() {
                 println!("Usage: forensic_copy --source <path> [--source <path> ...] --destination <path>");
                 println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
                 println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
+                println!("           [--icloud] [--icloud-csv <path>]");
                 return;
                 },
         };
     };
+
+    // iCloud mode forces SHA256 and Full hash mode
+    if icloud_enabled {
+        hashing_algorithm = HashingAlgorithm::Sha256;
+        hash_mode = HashMode::Full;
+    }
 
     let mut report_config = ReportConfig {enabled: false, output_path: None};
     let report_enabled = args.contains(&String::from("--report"));
@@ -125,14 +136,58 @@ fn main() {
         return;
     }
 
+    // iCloud mode setup
+    let icloud_mode = if icloud_enabled {
+        let csv_path_pos = args.iter().position(|a| a == "--icloud-csv");
+        let csv_path = if let Some(pos) = csv_path_pos {
+            if pos + 1 >= args.len() {
+                println!("Error: --icloud-csv requires a path argument.");
+                return;
+            }
+            PathBuf::from(&args[pos + 1])
+        } else {
+            // Auto-detect from sources
+            let mut found = None;
+            for src in &sources {
+                if let Some(p) = find_production_csv(src) {
+                    found = Some(p);
+                    break;
+                }
+            }
+            match found {
+                Some(p) => {
+                    println!("Auto-detected iCloud CSV: {}", p.display());
+                    p
+                }
+                None => {
+                    println!("Error: --icloud enabled but no account-download-details.csv found in sources.");
+                    println!("       Provide the path explicitly with --icloud-csv <path>.");
+                    return;
+                }
+            }
+        };
+
+        let hash_map = match parse_production_csv(&csv_path) {
+            Ok(m) => m,
+            Err(e) => {
+                println!("Error parsing iCloud CSV: {}", e);
+                return;
+            }
+        };
+        println!("iCloud Production mode: {} files in Apple CSV", hash_map.len());
+        Some(ICloudMode { csv_path, hash_map })
+    } else {
+        None
+    };
+
     let source_strings: Vec<String> = sources.iter().map(|s| s.display().to_string()).collect();
 
     let start = Instant::now();
 
-    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, |_done, _total, _filename| {
+    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, icloud_mode.as_ref(), |_done, _total, _filename| {
         // Progress is printed by forensic_copy via indicatif.
     }) {
-        Ok((results, dir_errors)) => {
+        Ok((results, dir_errors, missing_from_disk)) => {
             let total_time_ms = start.elapsed().as_millis() as u64;
             let skipped = results.iter().filter(|r| r.skipped).count();
             let verified = results.iter().filter(|r| r.verified).count();
@@ -140,13 +195,24 @@ fn main() {
             let meta_warnings = results.iter().filter(|r| r.metadata_error.is_some()).count();
             println!("Copied {} files in {}", results.len(), report::format_duration(total_time_ms));
             println!("Verified: {} Failed: {} Skipped: {} Metadata warnings: {} Dir metadata warnings: {}", verified, failed, skipped, meta_warnings, dir_errors.len());
+
+            if icloud_mode.is_some() {
+                let chain_verified = results.iter().filter(|r| r.full_chain_verified == Some(true)).count();
+                let transit_failures = results.iter().filter(|r| r.src_matches_apple == Some(false)).count();
+                println!("iCloud: Chain verified: {} Transit failures: {} Missing from disk: {}", chain_verified, transit_failures, missing_from_disk.len());
+            }
+
             let dir_error_strings: Vec<String> = dir_errors
                 .iter()
                 .map(|(path, err)| format!("{}: {}", path.display(), err))
                 .collect();
-            match report::generate_report(&results, &dir_error_strings, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config) {
+            match report::generate_report(&results, &dir_error_strings, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config, icloud_mode.as_ref(), &missing_from_disk) {
                 Err(e) => println!("Error: {}", e),
-                Ok(()) => println!("Report generated successfully!"),
+                Ok(()) => {
+                    if report_config.enabled {
+                        println!("Report generated successfully!");
+                    }
+                }
             };
         },
         Err(e) => println!("Error: {}", e),
