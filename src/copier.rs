@@ -95,7 +95,9 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
         use std::os::windows::fs::OpenOptionsExt;
         use std::os::windows::io::AsRawHandle;
         use windows::Win32::Foundation::{FILETIME, HANDLE};
-        use windows::Win32::Storage::FileSystem::{SetFileTime, FILE_WRITE_ATTRIBUTES};
+        use windows::Win32::Storage::FileSystem::{
+            SetFileTime, FILE_WRITE_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
+        };
 
         let birthtime = src_meta.creation_time();
         let creation_ft = FILETIME {
@@ -103,9 +105,16 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
             dwHighDateTime: (birthtime >> 32) as u32,
         };
 
+        // Directories require FILE_FLAG_BACKUP_SEMANTICS to open a handle
+        let flags = if dest.is_dir() {
+            FILE_WRITE_ATTRIBUTES.0 | FILE_FLAG_BACKUP_SEMANTICS.0
+        } else {
+            FILE_WRITE_ATTRIBUTES.0
+        };
+
         let file = std::fs::OpenOptions::new()
             .write(true)
-            .custom_flags(FILE_WRITE_ATTRIBUTES.0)
+            .custom_flags(flags)
             .open(dest)
             .map_err(|e| format!("birthtime open: {}", e))?;
 
