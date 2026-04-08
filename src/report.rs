@@ -48,8 +48,9 @@ pub fn generate_report(
 
     let total_files = results.len();
     let total_size: u64 = results.iter().map(|r| r.file_size).sum();
+    let skipped_count = results.iter().filter(|r| r.skipped).count();
     let verified_count = results.iter().filter(|r| r.verified).count();
-    let failed_count = total_files - verified_count;
+    let failed_count = total_files - verified_count - skipped_count;
     let meta_warn_count = results.iter().filter(|r| r.metadata_error.is_some()).count();
     let avg_time_ms = if total_files > 0 { total_time_ms / total_files as u64 } else { 0 };
 
@@ -69,6 +70,7 @@ pub fn generate_report(
     report.push_str(&format!("Avg Time/File:      {}\n", format_duration(avg_time_ms)));
     report.push_str(&format!("Verified:           {}\n", verified_count));
     report.push_str(&format!("Failed:             {}\n", failed_count));
+    report.push_str(&format!("Skipped:            {}\n", skipped_count));
     report.push_str(&format!("Metadata Warnings:  {}\n", meta_warn_count));
     report.push_str(&format!("Dir Meta Warnings:  {}\n", dir_errors.len()));
     report.push_str("----------------------------------------------------------\n");
@@ -76,13 +78,22 @@ pub fn generate_report(
     report.push_str("----------------------------------------------------------\n");
 
     for result in results {
-        let status = if result.error.is_some() { "[FAIL]" } else { "[PASS]" };
+        let status = if result.skipped {
+            "[SKIP]"
+        } else if result.error.is_some() {
+            "[FAIL]"
+        } else {
+            "[PASS]"
+        };
         report.push_str(&format!("{}  {}\n", status, result.source_path.display()));
         report.push_str(&format!("   Size:             {}\n", format_size(result.file_size)));
         report.push_str(&format!("   Source Hash:      {}\n", result.src_hash));
         report.push_str(&format!("   Destination Hash: {}\n", result.dest_hash));
         report.push_str(&format!("   Destination Path: {}\n", result.dest_path.display()));
         report.push_str(&format!("   Time:             {}\n", format_duration(result.copy_time_ms)));
+        if let Some(reason) = &result.skip_reason {
+            report.push_str(&format!("   Skip Reason:      {}\n", reason));
+        }
         if let Some(err) = &result.error {
             report.push_str(&format!("   Error:            {}\n", err));
         }
@@ -90,16 +101,18 @@ pub fn generate_report(
             report.push_str(&format!("   Metadata Warning: {}\n", meta_err));
         }
         report.push_str("\n");
-        if !dir_errors.is_empty() {
-            report.push_str("----------------------------------------------------------\n");
-            report.push_str("DIRECTORY METADATA WARNINGS:\n");
-            report.push_str("----------------------------------------------------------\n");
-            for err in dir_errors {
-                report.push_str(&format!("  ⚠  {}\n", err));
-            }
-            report.push_str("\n");
-        }
     }
+
+    if !dir_errors.is_empty() {
+        report.push_str("----------------------------------------------------------\n");
+        report.push_str("DIRECTORY METADATA WARNINGS:\n");
+        report.push_str("----------------------------------------------------------\n");
+        for err in dir_errors {
+            report.push_str(&format!("  ⚠  {}\n", err));
+        }
+        report.push_str("\n");
+    }
+
     report.push_str("==========================================================\n");
 
     match &config.output_path {

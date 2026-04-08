@@ -7,7 +7,7 @@ use rayon;
 use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
 use crate::hasher::{hash_file_with_progress, copy_and_hash};
-use crate::HashMode;
+use crate::{HashMode, ConflictMode};
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
 #[cfg(windows)]
@@ -23,6 +23,8 @@ pub struct FileCopyResult {
     pub src_hash: String,
     pub dest_hash: String,
     pub verified: bool,
+    pub skipped: bool,
+    pub skip_reason: Option<String>,
     pub error: Option<String>,
     pub copy_time_ms: u64,
     pub metadata_error: Option<String>,
@@ -209,6 +211,7 @@ fn process_file<F>(
     destination_path: &Path,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
+    conflict_mode: &ConflictMode,
     multi: &MultiProgress,
     overall_bar: &ProgressBar,
     completed: &AtomicU64,
@@ -228,6 +231,33 @@ where
     let file_size = fs::metadata(file)
         .map_err(|e| ForensicError::FileReadError(e.to_string()))?
         .len();
+
+    // Conflict check — Skip mode returns early without copying
+    if dest_path.exists() && *conflict_mode == ConflictMode::Skip {
+        overall_bar.inc(1);
+        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+        let filename = file.file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        multi.println(format!("Progress: {}/{} - {} (skipped)", done, total, &filename)).ok();
+        progress_callback(done, total, &filename);
+
+        return Ok(FileCopyResult {
+            source_path: file.to_path_buf(),
+            dest_path,
+            file_size,
+            src_hash: String::from("N/A"),
+            dest_hash: String::from("N/A"),
+            verified: false,
+            skipped: true,
+            skip_reason: Some(String::from("destination already exists")),
+            error: None,
+            copy_time_ms: 0,
+            metadata_error: None,
+        });
+    }
+    // Overwrite mode falls through to normal copy; Abort is handled before the parallel loop.
 
     let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
         let bar = multi.add(ProgressBar::new(file_size));
@@ -293,6 +323,8 @@ where
         src_hash,
         dest_hash,
         verified,
+        skipped: false,
+        skip_reason: None,
         error: if verified { None } else { Some(String::from("Hash mismatch!")) },
         copy_time_ms,
         metadata_error,
@@ -317,6 +349,7 @@ pub fn forensic_copy<F>(
     destination: &str,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
+    conflict_mode: &ConflictMode,
     progress_callback: F,
 ) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>), ForensicError>
 where
@@ -382,6 +415,23 @@ where
         }
     }
 
+    // Abort mode: fail immediately if any destination file already exists.
+    if *conflict_mode == ConflictMode::Abort {
+        for entry in &entries {
+            if let Ok(relative) = entry.file.strip_prefix(&entry.strip_base) {
+                let dest_path = destination_path
+                    .join(&entry.dest_prefix)
+                    .join(relative);
+                if dest_path.exists() {
+                    return Err(ForensicError::CopyError(format!(
+                        "Abort: destination file already exists: {}",
+                        dest_path.display()
+                    )));
+                }
+            }
+        }
+    }
+
     let multi = MultiProgress::new();
     let overall_bar = multi.add(ProgressBar::new(total));
     overall_bar.set_style(
@@ -419,7 +469,7 @@ where
                     let effective_dest = destination_path.join(&entry.dest_prefix);
                     let result = process_file(
                         &entry.file, &entry.strip_base, &effective_dest,
-                        algorithm, hash_mode, &multi, &overall_bar,
+                        algorithm, hash_mode, conflict_mode, &multi, &overall_bar,
                         &completed, total, &progress_callback,
                     );
 

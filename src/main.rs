@@ -1,7 +1,7 @@
 use std::time::Instant;
 use std::path::PathBuf;
 use report::ReportConfig;
-use forensic_copy::{HashMode, hasher::HashingAlgorithm, copier, report};
+use forensic_copy::{HashMode, ConflictMode, hasher::HashingAlgorithm, copier, report};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -9,7 +9,8 @@ fn main() {
     if args.len() < 3 {
         println!("Usage: forensic_copy --source <path> [--source <path> ...] --destination <path>");
         println!("       forensic_copy <source> <destination>");
-        println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report] [--report-path <path>]");
+        println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
+        println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
         return;
     }
 
@@ -38,7 +39,8 @@ fn main() {
             "md5"           => HashingAlgorithm::Md5,
             _               => {
                 println!("Usage: forensic_copy --source <path> [--source <path> ...] --destination <path>");
-                println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report] [--report-path <path>]");
+                println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
+                println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
                 return;
                 },
         };
@@ -56,6 +58,24 @@ fn main() {
         report_config.enabled = true;
         report_config.output_path = Some(PathBuf::from(report_path))
     };
+
+    let mut conflict_mode = ConflictMode::default();
+    let conflict_pos = args.iter().position(|a| a == "--on-conflict");
+    if let Some(pos) = conflict_pos {
+        if pos + 1 >= args.len() {
+            println!("Error: --on-conflict requires a mode argument (skip, overwrite, abort).");
+            return;
+        }
+        conflict_mode = match args[pos + 1].as_str() {
+            "skip"      => ConflictMode::Skip,
+            "overwrite" => ConflictMode::Overwrite,
+            "abort"     => ConflictMode::Abort,
+            other => {
+                println!("Error: unknown conflict mode '{}'. Use skip, overwrite, or abort.", other);
+                return;
+            }
+        };
+    }
 
     // Collect sources: either via --source flags or positional args (legacy)
     let mut sources: Vec<PathBuf> = Vec::new();
@@ -109,16 +129,17 @@ fn main() {
 
     let start = Instant::now();
 
-    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, |_done, _total, _filename| {
+    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, |_done, _total, _filename| {
         // Progress is printed by forensic_copy via indicatif.
     }) {
         Ok((results, dir_errors)) => {
             let total_time_ms = start.elapsed().as_millis() as u64;
+            let skipped = results.iter().filter(|r| r.skipped).count();
             let verified = results.iter().filter(|r| r.verified).count();
-            let failed = results.len() - verified;
+            let failed = results.len() - verified - skipped;
             let meta_warnings = results.iter().filter(|r| r.metadata_error.is_some()).count();
             println!("Copied {} files in {}", results.len(), report::format_duration(total_time_ms));
-            println!("Verified: {} Failed: {} Metadata warnings: {} Dir metadata warnings: {}", verified, failed, meta_warnings, dir_errors.len());
+            println!("Verified: {} Failed: {} Skipped: {} Metadata warnings: {} Dir metadata warnings: {}", verified, failed, skipped, meta_warnings, dir_errors.len());
             let dir_error_strings: Vec<String> = dir_errors
                 .iter()
                 .map(|(path, err)| format!("{}: {}", path.display(), err))

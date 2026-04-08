@@ -12,3 +12,16 @@ pub enum HashMode {
     NoHash,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum ConflictMode {
+    Skip,
+    Overwrite,
+    Abort,
+}
+
+impl Default for ConflictMode {
+    fn default() -> Self {
+        ConflictMode::Skip
+    }
+}
+
