@@ -119,7 +119,11 @@ fn main() {
             let meta_warnings = results.iter().filter(|r| r.metadata_error.is_some()).count();
             println!("Copied {} files in {}", results.len(), report::format_duration(total_time_ms));
             println!("Verified: {} Failed: {} Metadata warnings: {} Dir metadata warnings: {}", verified, failed, meta_warnings, dir_errors.len());
-            match report::generate_report(&results, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config) {
+            let dir_error_strings: Vec<String> = dir_errors
+                .iter()
+                .map(|(path, err)| format!("{}: {}", path.display(), err))
+                .collect();
+            match report::generate_report(&results, &dir_error_strings, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config) {
                 Err(e) => println!("Error: {}", e),
                 Ok(()) => println!("Report generated successfully!"),
             };

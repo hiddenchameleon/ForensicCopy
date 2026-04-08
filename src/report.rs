@@ -14,6 +14,7 @@ pub struct ReportConfig {
 
 pub fn generate_report(
     results: &[FileCopyResult],
+    dir_errors: &[String],
     sources: &[String],
     destination: &str,
     algorithm: &HashingAlgorithm,
@@ -69,6 +70,7 @@ pub fn generate_report(
     report.push_str(&format!("Verified:           {}\n", verified_count));
     report.push_str(&format!("Failed:             {}\n", failed_count));
     report.push_str(&format!("Metadata Warnings:  {}\n", meta_warn_count));
+    report.push_str(&format!("Dir Meta Warnings:  {}\n", dir_errors.len()));
     report.push_str("----------------------------------------------------------\n");
     report.push_str("FILE DETAILS:\n");
     report.push_str("----------------------------------------------------------\n");
@@ -88,6 +90,15 @@ pub fn generate_report(
             report.push_str(&format!("   Metadata Warning: {}\n", meta_err));
         }
         report.push_str("\n");
+        if !dir_errors.is_empty() {
+            report.push_str("----------------------------------------------------------\n");
+            report.push_str("DIRECTORY METADATA WARNINGS:\n");
+            report.push_str("----------------------------------------------------------\n");
+            for err in dir_errors {
+                report.push_str(&format!("  ⚠  {}\n", err));
+            }
+            report.push_str("\n");
+        }
     }
     report.push_str("==========================================================\n");
 
