@@ -4,6 +4,7 @@ use std::fs;
 
 /// Parsed iCloud Production CSV data — carries the CSV path and the
 /// File_Name → GPG_SHA256 mapping for three-way hash comparison.
+#[derive(Clone)]
 pub struct ICloudMode {
     pub csv_path: PathBuf,
     pub hash_map: HashMap<String, String>,

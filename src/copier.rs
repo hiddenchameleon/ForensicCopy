@@ -1,6 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 use filetime::FileTime;
 use rayon;
@@ -81,9 +82,8 @@ fn collect_files_inner(
                 .and_then(|n| n.to_str())
                 .unwrap_or("");
             if !file_name.starts_with("._") {
-                let canonical = fs::canonicalize(&path)
-                    .unwrap_or_else(|_| path.clone());
-                if seen.insert(canonical) {
+                // Only canonicalize when we detect a collision (hardlink/symlink)
+                if seen.insert(path.clone()) {
                     files.push(path);
                 }
             }
@@ -95,6 +95,13 @@ fn collect_files_inner(
 fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     let src_meta = fs::metadata(src).map_err(|e| e.to_string())?;
 
+    // Cache metadata once for all platform-specific operations
+    #[cfg(windows)]
+    let birthtime = src_meta.creation_time();
+    #[cfg(target_os = "macos")]
+    let birthtime = src_meta.created().ok();
+
+    // Always set access and modification times
     let atime = FileTime::from_last_access_time(&src_meta);
     let mtime = FileTime::from_last_modification_time(&src_meta);
     filetime::set_file_times(dest, atime, mtime).map_err(|e| e.to_string())?;
@@ -108,7 +115,6 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
             SetFileTime, FILE_WRITE_ATTRIBUTES, FILE_FLAG_BACKUP_SEMANTICS,
         };
 
-        let birthtime = src_meta.creation_time();
         let creation_ft = FILETIME {
             dwLowDateTime: (birthtime & 0xFFFFFFFF) as u32,
             dwHighDateTime: (birthtime >> 32) as u32,
@@ -140,9 +146,8 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
         use libc::{attrlist, setattrlist, ATTR_BIT_MAP_COUNT, ATTR_CMN_CRTIME};
         use std::ffi::CString;
 
-        let birthtime = src_meta.created()
-            .map_err(|e| format!("birthtime read: {}", e))?;
         let secs = birthtime
+            .ok_or_else(|| "birthtime read failed".to_string())?
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| format!("birthtime duration: {}", e))?
             .as_secs() as libc::time_t;
@@ -212,7 +217,7 @@ fn preserve_metadata(src: &Path, dest: &Path) -> Result<(), String> {
     Ok(())
 }
 
-fn process_file<F>(
+fn process_file<F, B>(
     file: &Path,
     source_path: &Path,
     destination_path: &Path,
@@ -225,9 +230,11 @@ fn process_file<F>(
     completed: &AtomicU64,
     total: u64,
     progress_callback: &F,
+    byte_progress_callback: &B,
 ) -> Result<FileCopyResult, ForensicError>
 where
     F: Fn(u64, u64, &str) + Send + Sync,
+    B: Fn(&str, u64, u64, u64, bool, bool) + Send + Sync,
 {
     let start = Instant::now();
 
@@ -272,7 +279,10 @@ where
     }
     // Overwrite mode falls through to normal copy; Abort is handled before the parallel loop.
 
-    let file_bar = if file_size >= LARGE_FILE_THRESHOLD {
+    let large_file = file_size >= LARGE_FILE_THRESHOLD;
+    let file_id = file.display().to_string();
+
+    let file_bar = if large_file {
         let bar = multi.add(ProgressBar::new(file_size));
         bar.set_style(
             ProgressStyle::with_template(
@@ -292,6 +302,19 @@ where
         None
     };
 
+    let last_emit: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+    let throttled_byte_cb = |bytes_done: u64, bytes_total: u64| {
+        let mut last = last_emit.lock().unwrap();
+        let should_emit = match *last {
+            None => true,
+            Some(t) => t.elapsed().as_millis() >= 1000,
+        };
+        if should_emit {
+            byte_progress_callback(&file_id, bytes_done, bytes_total, file_size, false, false);
+            *last = Some(Instant::now());
+        }
+    };
+
     // Single-pass copy+hash avoids reading the source file twice.
     let src_hash = match hash_mode {
         HashMode::NoHash => {
@@ -299,10 +322,17 @@ where
                 .map_err(|e| ForensicError::CopyError(e.to_string()))?;
             String::from("N/A")
         }
-        _ => copy_and_hash(file, &dest_path, algorithm, file_bar.as_ref())?,
+        _ => {
+            let byte_cb: Option<&dyn Fn(u64, u64)> = if large_file { Some(&throttled_byte_cb) } else { None };
+            copy_and_hash(file, &dest_path, algorithm, file_bar.as_ref(), file_size, byte_cb)?
+        }
     };
 
     let metadata_error = preserve_metadata(file, &dest_path).err();
+
+    if large_file && matches!(hash_mode, HashMode::Full) {
+        byte_progress_callback(&file_id, file_size, file_size, file_size, false, true);
+    }
 
     let (dest_hash, verified) = match hash_mode {
         HashMode::Full => {
@@ -313,6 +343,10 @@ where
         HashMode::NoVerify => (String::from("N/A"), true),
         HashMode::NoHash => (String::from("N/A"), true),
     };
+
+    if large_file {
+        byte_progress_callback(&file_id, file_size, file_size, file_size, true, false);
+    }
 
     if let Some(bar) = file_bar {
         bar.finish_and_clear();
@@ -379,26 +413,36 @@ struct CopyEntry {
     /// For directory sources this is the directory's name; for individual
     /// files this is empty (file lands directly in the destination root).
     dest_prefix: PathBuf,
+    /// iCloud mode for this file's source, if applicable.
+    icloud_mode: Option<Arc<ICloudMode>>,
 }
 
-pub fn forensic_copy<F>(
+pub fn forensic_copy<F, B>(
     sources: &[PathBuf],
     destination: &str,
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
     conflict_mode: &ConflictMode,
-    icloud_mode: Option<&ICloudMode>,
+    source_icloud_modes: Vec<Option<ICloudMode>>,
     progress_callback: F,
+    byte_progress_callback: B,
 ) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>, Vec<(String, String)>), ForensicError>
 where
     F: Fn(u64, u64, &str) + Send + Sync,
+    B: Fn(&str, u64, u64, u64, bool, bool) + Send + Sync,
 {
     if sources.is_empty() {
         return Err(ForensicError::DirectoryNotFound("no sources provided".to_string()));
     }
 
-    // iCloud mode enforcement
-    if let Some(_icloud) = icloud_mode {
+    // Build per-source Arcs
+    let source_arcs: Vec<Option<Arc<ICloudMode>>> = source_icloud_modes
+        .into_iter()
+        .map(|opt| opt.map(Arc::new))
+        .collect();
+
+    // iCloud mode enforcement — if any source has iCloud, require SHA256 + Full
+    if source_arcs.iter().any(|m| m.is_some()) {
         if !matches!(algorithm, HashingAlgorithm::Sha256) {
             return Err(ForensicError::CopyError(
                 "iCloud Production mode requires SHA256 hashing algorithm".to_string(),
@@ -423,10 +467,12 @@ where
     // Track (source_path, dest_prefix) pairs for directory metadata preservation.
     let mut dir_sources: Vec<(PathBuf, PathBuf)> = Vec::new();
 
-    for src in sources {
+    for (src_idx, src) in sources.iter().enumerate() {
         if !src.exists() {
             return Err(ForensicError::DirectoryNotFound(src.display().to_string()));
         }
+
+        let src_icloud = source_arcs.get(src_idx).and_then(|m| m.clone());
 
         if src.is_dir() {
             let dir_name = src.file_name()
@@ -439,6 +485,7 @@ where
                     file: f,
                     strip_base: src.clone(),
                     dest_prefix: dest_prefix.clone(),
+                    icloud_mode: src_icloud.clone(),
                 });
             }
             dir_sources.push((src.clone(), dest_prefix));
@@ -450,6 +497,7 @@ where
                 file: src.clone(),
                 strip_base: parent.to_path_buf(),
                 dest_prefix: PathBuf::new(),
+                icloud_mode: src_icloud,
             });
         }
     }
@@ -521,8 +569,9 @@ where
                     let effective_dest = destination_path.join(&entry.dest_prefix);
                     let result = process_file(
                         &entry.file, &entry.strip_base, &effective_dest,
-                        algorithm, hash_mode, conflict_mode, icloud_mode, &multi,
+                        algorithm, hash_mode, conflict_mode, entry.icloud_mode.as_deref(), &multi,
                         &overall_bar, &completed, total, &progress_callback,
+                        &byte_progress_callback,
                     );
 
                     match result {
@@ -582,23 +631,25 @@ where
         }
     }
 
-    // Collect files listed in Apple CSV but not found on disk
-    let missing_from_disk: Vec<(String, String)> = if let Some(icloud) = icloud_mode {
-        let copied_filenames: HashSet<String> = file_results.iter()
-            .filter_map(|r| {
-                r.source_path.file_name()
-                    .and_then(|n| n.to_str())
-                    .map(|s| s.to_string())
-            })
-            .collect();
-
-        icloud.hash_map.iter()
-            .filter(|(name, _)| !copied_filenames.contains(name.as_str()))
-            .map(|(name, hash)| (name.clone(), hash.clone()))
-            .collect()
-    } else {
-        Vec::new()
-    };
+    // Collect files listed in each source's Apple CSV but not found on disk
+    let mut missing_from_disk: Vec<(String, String)> = Vec::new();
+    for (src_idx, src) in sources.iter().enumerate() {
+        if let Some(icloud) = source_arcs.get(src_idx).and_then(|m| m.as_ref()) {
+            let copied_filenames: HashSet<String> = file_results.iter()
+                .filter(|r| r.source_path.starts_with(src))
+                .filter_map(|r| {
+                    r.source_path.file_name()
+                        .and_then(|n| n.to_str())
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            for (name, hash) in &icloud.hash_map {
+                if !copied_filenames.contains(name.as_str()) {
+                    missing_from_disk.push((name.clone(), hash.clone()));
+                }
+            }
+        }
+    }
 
     Ok((file_results, dir_metadata_errors, missing_from_disk))
 }

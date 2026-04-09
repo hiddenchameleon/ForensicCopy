@@ -22,7 +22,7 @@ pub fn generate_report(
     hash_mode: &HashMode,
     total_time_ms: u64,
     config: &ReportConfig,
-    icloud_mode: Option<&ICloudMode>,
+    icloud_modes: &[&ICloudMode],
     missing_from_disk: &[(String, String)],
 ) -> Result<(), ForensicError> {
     if !config.enabled {
@@ -78,7 +78,7 @@ pub fn generate_report(
     report.push_str(&format!("Dir Meta Warnings:  {}\n", dir_errors.len()));
 
     // iCloud Production summary
-    if let Some(icloud) = icloud_mode {
+    if !icloud_modes.is_empty() {
         let chain_verified = results.iter()
             .filter(|r| r.full_chain_verified == Some(true))
             .count();
@@ -95,10 +95,19 @@ pub fn generate_report(
         let missing_from_csv = results.iter()
             .filter(|r| r.apple_hash_missing)
             .count();
+        let total_csv_entries: usize = icloud_modes.iter().map(|m| m.hash_map.len()).sum();
 
         report.push_str("----------------------------------------------------------\n");
         report.push_str("iCloud Production:  Yes\n");
-        report.push_str(&format!("CSV File:           {}\n", icloud.csv_path.display()));
+        if icloud_modes.len() == 1 {
+            report.push_str(&format!("CSV File:           {}\n", icloud_modes[0].csv_path.display()));
+        } else {
+            report.push_str(&format!("CSV Files ({}):\n", icloud_modes.len()));
+            for m in icloud_modes {
+                report.push_str(&format!("  - {}\n", m.csv_path.display()));
+            }
+        }
+        report.push_str(&format!("Total CSV Entries:  {}\n", total_csv_entries));
         report.push_str(&format!("Chain Verified:     {} / {} files (full Apple hash match)\n", chain_verified, with_apple_hash));
         report.push_str(&format!("Transit Failures:   {} (Source Hash != Apple CSV Hash)\n", transit_failures));
         report.push_str(&format!("Copy Failures:      {} (Destination Hash != Source Hash)\n", copy_failures));
@@ -160,7 +169,7 @@ pub fn generate_report(
     }
 
     // iCloud chain of custody failures section
-    if icloud_mode.is_some() {
+    if !icloud_modes.is_empty() {
         let chain_failures: Vec<&FileCopyResult> = results.iter()
             .filter(|r| r.full_chain_verified == Some(false))
             .collect();

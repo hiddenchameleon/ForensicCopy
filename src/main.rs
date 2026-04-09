@@ -180,13 +180,18 @@ fn main() {
         None
     };
 
+    // Apply the same icloud_mode to all sources (CLI is single-mode)
+    let source_icloud_modes: Vec<Option<ICloudMode>> = sources.iter()
+        .map(|_| icloud_mode.clone())
+        .collect();
+
     let source_strings: Vec<String> = sources.iter().map(|s| s.display().to_string()).collect();
 
     let start = Instant::now();
 
-    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, icloud_mode.as_ref(), |_done, _total, _filename| {
+    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, source_icloud_modes, |_done, _total, _filename| {
         // Progress is printed by forensic_copy via indicatif.
-    }) {
+    }, |_file_id, _bytes_done, _bytes_total, _file_size, _is_complete, _is_verifying| {}) {
         Ok((results, dir_errors, missing_from_disk)) => {
             let total_time_ms = start.elapsed().as_millis() as u64;
             let skipped = results.iter().filter(|r| r.skipped).count();
@@ -206,7 +211,8 @@ fn main() {
                 .iter()
                 .map(|(path, err)| format!("{}: {}", path.display(), err))
                 .collect();
-            match report::generate_report(&results, &dir_error_strings, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config, icloud_mode.as_ref(), &missing_from_disk) {
+            let active_icloud_refs: Vec<&ICloudMode> = icloud_mode.iter().collect();
+            match report::generate_report(&results, &dir_error_strings, &source_strings, &destination, &hashing_algorithm, &hash_mode, total_time_ms, &report_config, &active_icloud_refs, &missing_from_disk) {
                 Err(e) => println!("Error: {}", e),
                 Ok(()) => {
                     if report_config.enabled {
