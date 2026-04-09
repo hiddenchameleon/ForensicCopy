@@ -22,6 +22,8 @@ pub enum ForensicError {
     // InvalidSource(String),
     #[error("Failed to write report: {0}")]
     ReportWriteFailed(String),
+    #[error("Operation aborted")]
+    Aborted,
     // #[error("Invalid report path: {0}")]
     // ReportPathInvalid(String),
     // #[error("Unsupported hash algorithm: {0}")]

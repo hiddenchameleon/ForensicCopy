@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 use filetime::FileTime;
 use rayon;
@@ -16,6 +16,55 @@ use std::collections::HashSet;
 use std::os::windows::fs::MetadataExt;
 
 const LARGE_FILE_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Shared control state for pause/resume/stop from the GUI.
+pub struct CopyControl {
+    state: AtomicU8,   // 0 = running, 1 = paused, 2 = stopped
+    condvar: Condvar,
+    mutex: Mutex<()>,
+}
+
+impl CopyControl {
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+            condvar: Condvar::new(),
+            mutex: Mutex::new(()),
+        }
+    }
+
+    pub fn pause(&self) {
+        self.state.store(1, Ordering::SeqCst);
+    }
+
+    pub fn resume(&self) {
+        self.state.store(0, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+
+    pub fn stop(&self) {
+        self.state.store(2, Ordering::SeqCst);
+        self.condvar.notify_all();
+    }
+
+    /// Called per chunk from copy/hash loops. Blocks while paused.
+    /// Returns true if the operation should abort (stopped).
+    pub fn check(&self) -> bool {
+        loop {
+            match self.state.load(Ordering::SeqCst) {
+                0 => return false,
+                1 => {
+                    let guard = self.mutex.lock().unwrap();
+                    drop(self.condvar.wait_while(guard, |_| {
+                        self.state.load(Ordering::SeqCst) == 1
+                    }));
+                    // Re-check after wakeup — may have been stopped
+                }
+                _ => return true,
+            }
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct FileCopyResult {
@@ -231,6 +280,7 @@ fn process_file<F, B>(
     total: u64,
     progress_callback: &F,
     byte_progress_callback: &B,
+    check_control: &dyn Fn() -> bool,
 ) -> Result<FileCopyResult, ForensicError>
 where
     F: Fn(u64, u64, &str) + Send + Sync,
@@ -247,35 +297,59 @@ where
         .map_err(|e| ForensicError::FileReadError(e.to_string()))?
         .len();
 
-    // Conflict check — Skip mode returns early without copying
+    // Conflict check — Skip mode skips only when destination is verified identical.
     if dest_path.exists() && *conflict_mode == ConflictMode::Skip {
-        overall_bar.inc(1);
-        let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
-        let filename = file.file_name()
-            .unwrap_or_default()
-            .to_string_lossy()
-            .to_string();
-        multi.println(format!("Progress: {}/{} - {} (skipped)", done, total, &filename)).ok();
-        progress_callback(done, total, &filename);
+        let src_meta = fs::metadata(file)
+            .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
+        let dest_meta = fs::metadata(&dest_path)
+            .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
 
-        return Ok(FileCopyResult {
-            source_path: file.to_path_buf(),
-            dest_path,
-            file_size,
-            src_hash: String::from("N/A"),
-            dest_hash: String::from("N/A"),
-            verified: false,
-            skipped: true,
-            skip_reason: Some(String::from("destination already exists")),
-            error: None,
-            copy_time_ms: 0,
-            metadata_error: None,
-            apple_hash: None,
-            src_matches_apple: None,
-            dest_matches_apple: None,
-            full_chain_verified: None,
-            apple_hash_missing: false,
-        });
+        let sizes_match = src_meta.len() == dest_meta.len();
+        let mtimes_match = FileTime::from_last_modification_time(&src_meta)
+            == FileTime::from_last_modification_time(&dest_meta);
+
+        if sizes_match && mtimes_match {
+            let (src_hash, dest_hash, hashes_match) = match hash_mode {
+                HashMode::NoHash => (String::from("N/A"), String::from("N/A"), true),
+                _ => {
+                    let sh = hash_file_with_progress(file, algorithm, None)?;
+                    let dh = hash_file_with_progress(&dest_path, algorithm, None)?;
+                    let m = sh == dh;
+                    (sh, dh, m)
+                }
+            };
+
+            if hashes_match {
+                overall_bar.inc(1);
+                let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
+                let filename = file.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                multi.println(format!("Progress: {}/{} - {} (skipped, verified)", done, total, &filename)).ok();
+                progress_callback(done, total, &filename);
+
+                return Ok(FileCopyResult {
+                    source_path: file.to_path_buf(),
+                    dest_path,
+                    file_size,
+                    src_hash,
+                    dest_hash,
+                    verified: true,
+                    skipped: true,
+                    skip_reason: Some(String::from("destination verified (hash + metadata match)")),
+                    error: None,
+                    copy_time_ms: 0,
+                    metadata_error: None,
+                    apple_hash: None,
+                    src_matches_apple: None,
+                    dest_matches_apple: None,
+                    full_chain_verified: None,
+                    apple_hash_missing: false,
+                });
+            }
+        }
+        // Size, mtime, or hash mismatch — fall through to overwrite.
     }
     // Overwrite mode falls through to normal copy; Abort is handled before the parallel loop.
 
@@ -324,7 +398,13 @@ where
         }
         _ => {
             let byte_cb: Option<&dyn Fn(u64, u64)> = if large_file { Some(&throttled_byte_cb) } else { None };
-            copy_and_hash(file, &dest_path, algorithm, file_bar.as_ref(), file_size, byte_cb)?
+            match copy_and_hash(file, &dest_path, algorithm, file_bar.as_ref(), file_size, byte_cb, check_control) {
+                Err(ForensicError::Aborted) => {
+                    let _ = fs::remove_file(&dest_path);
+                    return Err(ForensicError::Aborted);
+                }
+                other => other?,
+            }
         }
     };
 
@@ -424,6 +504,7 @@ pub fn forensic_copy<F, B>(
     hash_mode: &HashMode,
     conflict_mode: &ConflictMode,
     source_icloud_modes: Vec<Option<ICloudMode>>,
+    control: Arc<CopyControl>,
     progress_callback: F,
     byte_progress_callback: B,
 ) -> Result<(Vec<FileCopyResult>, Vec<(PathBuf, String)>, Vec<(String, String)>), ForensicError>
@@ -560,6 +641,12 @@ where
                         return;
                     }
 
+                    // Check stop signal before picking up a new file.
+                    if control.check() {
+                        *first_error.lock().unwrap() = Some(ForensicError::Aborted);
+                        return;
+                    }
+
                     let idx = next_index.fetch_add(1, Ordering::Relaxed) as usize;
                     if idx >= entries.len() {
                         return;
@@ -567,11 +654,12 @@ where
 
                     let entry = &entries[idx];
                     let effective_dest = destination_path.join(&entry.dest_prefix);
+                    let check_fn = || control.check();
                     let result = process_file(
                         &entry.file, &entry.strip_base, &effective_dest,
                         algorithm, hash_mode, conflict_mode, entry.icloud_mode.as_deref(), &multi,
                         &overall_bar, &completed, total, &progress_callback,
-                        &byte_progress_callback,
+                        &byte_progress_callback, &check_fn,
                     );
 
                     match result {

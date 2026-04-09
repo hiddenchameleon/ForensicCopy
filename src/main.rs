@@ -1,7 +1,8 @@
 use std::time::Instant;
 use std::path::PathBuf;
 use report::ReportConfig;
-use forensic_copy::{HashMode, ConflictMode, hasher::HashingAlgorithm, copier, report};
+use forensic_copy::{HashMode, ConflictMode, hasher::HashingAlgorithm, copier::{self, CopyControl}, report};
+use std::sync::Arc;
 use forensic_copy::icloud::{ICloudMode, find_production_csv, parse_production_csv};
 
 fn main() {
@@ -189,7 +190,7 @@ fn main() {
 
     let start = Instant::now();
 
-    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, source_icloud_modes, |_done, _total, _filename| {
+    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, source_icloud_modes, Arc::new(CopyControl::new()), |_done, _total, _filename| {
         // Progress is printed by forensic_copy via indicatif.
     }, |_file_id, _bytes_done, _bytes_total, _file_size, _is_complete, _is_verifying| {}) {
         Ok((results, dir_errors, missing_from_disk)) => {

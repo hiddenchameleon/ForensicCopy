@@ -90,6 +90,7 @@ pub fn copy_and_hash(
     progress: Option<&ProgressBar>,
     file_size: u64,
     byte_progress: Option<&dyn Fn(u64, u64)>,
+    check_control: &dyn Fn() -> bool,
 ) -> Result<String, ForensicError> {
     let src_file = File::open(src)
         .map_err(|e| ForensicError::FileReadError(e.to_string()))?;
@@ -119,6 +120,7 @@ pub fn copy_and_hash(
                 if let Some(cb) = byte_progress {
                     cb(bytes_done, file_size);
                 }
+                if check_control() { return Err(ForensicError::Aborted); }
             }
             writer.flush().map_err(|e| ForensicError::CopyError(e.to_string()))?;
             Ok(hex::encode(hasher.finalize()))
@@ -140,6 +142,7 @@ pub fn copy_and_hash(
                 if let Some(cb) = byte_progress {
                     cb(bytes_done, file_size);
                 }
+                if check_control() { return Err(ForensicError::Aborted); }
             }
             writer.flush().map_err(|e| ForensicError::CopyError(e.to_string()))?;
             Ok(hex::encode(hasher.finalize()))
@@ -161,6 +164,7 @@ pub fn copy_and_hash(
                 if let Some(cb) = byte_progress {
                     cb(bytes_done, file_size);
                 }
+                if check_control() { return Err(ForensicError::Aborted); }
             }
             writer.flush().map_err(|e| ForensicError::CopyError(e.to_string()))?;
             Ok(hasher.finalize().to_hex().to_string())
