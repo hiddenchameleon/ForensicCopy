@@ -26,3 +26,16 @@ impl Default for ConflictMode {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum ThreadSpeed {
+    Full,
+    Half,
+    Slow,
+}
+
+impl Default for ThreadSpeed {
+    fn default() -> Self {
+        ThreadSpeed::Full
+    }
+}
+

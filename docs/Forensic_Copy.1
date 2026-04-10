@@ -1,0 +1,298 @@
+.TH FORENSIC_COPY 1 "2026-04-09" "Forensic_Copy 1.1.0" "User Commands"
+.SH NAME
+forensic_copy \- forensically sound file copy with cryptographic hash verification
+.SH SYNOPSIS
+.B forensic_copy
+.B \-\-source
+.I path
+[\fB\-\-source\fR \fIpath\fR \&...]
+.B \-\-destination
+.I path
+[\fIoptions\fR]
+.PP
+.B forensic_copy
+.I source destination
+[\fIoptions\fR]
+.SH DESCRIPTION
+.B forensic_copy
+copies one or more source directories or files to a destination, computing and
+verifying cryptographic hashes to confirm bit-for-bit integrity.  It preserves
+file timestamps (access time, modification time, and birthtime/creation time on
+macOS and Windows), Unix permissions, ownership, and extended attributes
+(\fBxattr\fR(1) on Unix).
+.PP
+Files are copied in parallel using the Rayon thread pool.  A streaming
+single-pass implementation hashes data during the copy so the source file is
+read only once.  For files 100\ MiB and larger an additional per-file progress
+bar is displayed.
+.PP
+In
+.B iCloud Production
+mode the tool performs a three-way chain-of-custody comparison: each file's
+computed hash is checked against both the locally computed destination hash and
+the SHA-256 hash provided by Apple in the
+.I account-download-details.csv
+production-download manifest.
+.SH OPTIONS
+.SS Sources and Destination
+.TP
+.BI \-\-source " path"
+Source file or directory to copy.  May be specified multiple times to copy
+several sources into the same destination in a single invocation.
+.TP
+.BI \-\-destination " path"
+Destination directory.  Created automatically if it does not exist.
+.TP
+.IR source " " destination
+Legacy positional form accepted for backwards compatibility.  Equivalent to
+.BR "\-\-source " \fIsource\fR " \-\-destination " \fIdestination\fR .
+.SS Hashing
+.TP
+.BI \-\-hash " algorithm"
+Select the hashing algorithm.  Valid values:
+.RS
+.IP \fBsha256\fR 10
+SHA-256 (default).
+.IP \fBblake3\fR 10
+BLAKE3 with Rayon-accelerated parallelism for large files.
+.IP \fBmd5\fR 10
+MD5.  Not recommended for forensic work; included for legacy compatibility.
+.RE
+.TP
+.B \-\-no-hash
+Skip hashing entirely.  Copy is performed with
+.BR fs::copy (3)
+and no integrity check is done.  Mutually exclusive with
+.BR \-\-no-verify .
+.TP
+.B \-\-no-verify
+Hash the source file during the copy pass but do not re-hash the destination
+for verification.  The destination hash is reported as
+.BR N/A .
+Faster than full mode but provides no copy-integrity guarantee.  Mutually
+exclusive with
+.BR \-\-no-hash .
+.SS Conflict Handling
+.TP
+.BI \-\-on-conflict " mode"
+Action when a destination file already exists.  Default:
+.BR skip .
+Valid values:
+.RS
+.IP \fBskip\fR 12
+Skip the file if the destination exists
+.I and
+size, modification time, and hash all match the source.  If any attribute
+differs the file is overwritten.
+.IP \fBoverwrite\fR 12
+Always overwrite existing destination files.
+.IP \fBabort\fR 12
+Abort the entire operation immediately if
+.I any
+destination file already exists.
+.RE
+.SS Speed Control
+.TP
+.BI \-\-speed " mode"
+Controls the Rayon thread pool size used for parallel file copying and hashing.
+Default:
+.BR full .
+Valid values:
+.RS
+.IP \fBfull\fR 10
+Use all logical CPU cores.
+Maximum throughput.
+.IP \fBhalf\fR 10
+Use half the logical CPU cores (minimum 1).
+Leaves resources available for other processes running on the same machine.
+.IP \fBslow\fR 10
+Use a single thread.
+Minimal impact on the host system; recommended when copying from a live
+evidence machine where I/O contention must be kept low.
+.RE
+.PP
+Speed controls both file-copy parallelism and BLAKE3 large-file hashing
+parallelism, which also uses Rayon internally.  Choosing
+.B slow
+guarantees that at most one file and one hash operation run at a time.
+.SS Reporting
+.TP
+.B \-\-report
+Print a detailed forensic report to standard output after the copy completes.
+.TP
+.BI \-\-report-path " path"
+Write the forensic report to
+.I path
+instead of standard output.  Implies
+.BR \-\-report .
+.SS iCloud Production Mode
+.TP
+.B \-\-icloud
+Enable iCloud Production mode.  Forces
+.B \-\-hash sha256
+and full verification regardless of other flags.  The tool will search each
+source directory recursively for a file whose name ends in
+.I \-account-download-details.csv
+and use it as the Apple hash manifest.  Cannot be combined with
+.B \-\-no-hash
+or
+.BR \-\-no-verify .
+.TP
+.BI \-\-icloud-csv " path"
+Provide the Apple production CSV explicitly instead of relying on
+auto-detection.  Requires
+.BR \-\-icloud .
+.SH EXAMPLES
+.SS Basic copy (SHA-256, full verification)
+.nf
+forensic_copy --source /Volumes/Evidence --destination /mnt/working/Evidence
+.fi
+.SS Copy with BLAKE3 hashing
+.nf
+forensic_copy --source /Volumes/Evidence --destination /mnt/working/Evidence \\
+    --hash blake3
+.fi
+.SS Skip verification (hash source only, faster)
+.nf
+forensic_copy --source /Volumes/Evidence --destination /mnt/working/Evidence \\
+    --no-verify
+.fi
+.SS Copy without any hashing
+.nf
+forensic_copy --source /Volumes/Evidence --destination /mnt/working/Evidence \\
+    --no-hash
+.fi
+.SS Multiple sources into one destination with a written report
+.nf
+forensic_copy \\
+    --source /Volumes/Phone/DCIM \\
+    --source /Volumes/Phone/Downloads \\
+    --destination /mnt/case01 \\
+    --report-path /mnt/case01/forensic_report.txt
+.fi
+.SS Overwrite existing files and abort on conflict (separate invocations)
+.nf
+# Overwrite mode:
+forensic_copy --source /Volumes/USB --destination /mnt/dest \\
+    --on-conflict overwrite
+
+# Abort if destination already has any matching filename:
+forensic_copy --source /Volumes/USB --destination /mnt/dest \\
+    --on-conflict abort
+.fi
+.SS iCloud Production mode with auto-detected CSV
+.nf
+forensic_copy --source /Users/examiner/Downloads/iCloud_export \\
+    --destination /mnt/case01/icloud \\
+    --icloud \\
+    --report-path /mnt/case01/icloud_chain_report.txt
+.fi
+.SS iCloud Production mode with explicit CSV path
+.nf
+forensic_copy --source /Users/examiner/Downloads/iCloud_export \\
+    --destination /mnt/case01/icloud \\
+    --icloud \\
+    --icloud-csv /path/to/abc123-account-download-details.csv \\
+    --report-path /mnt/case01/icloud_chain_report.txt
+.fi
+.SH EXIT STATUS
+.B forensic_copy
+does not use explicit non-zero exit codes in the current release.  All
+diagnostic messages (argument errors, copy failures, hash mismatches) are
+printed to standard output.  Hash mismatch is recorded per-file in the results
+and report but does not affect the process exit status.
+.PP
+.TP
+.B 0
+Normal exit in all cases, including when individual file copies fail or hashes
+do not match.  Check the console output or report for per-file results.
+.SH FILES
+.TP
+.I <destination>/<source-name>/
+Directory tree created by a directory-source copy.  Mirrors the source tree
+rooted at the source directory's base name.
+.TP
+.I <path>
+Forensic report file written when
+.B \-\-report-path
+is supplied.  Plain-text format.
+.TP
+.I *-account-download-details.csv
+Apple iCloud production download manifest searched for automatically when
+.B \-\-icloud
+is used.  Must contain columns
+.B File_Name
+and
+.BR GPG_SHA256 .
+.SH NOTES
+.SS Forensic integrity
+Copy and hash are performed in a single streaming pass so the source is read
+exactly once per file.  Verification (re-hash of the destination) is a separate
+pass and only performed in default
+.I Full
+mode.  Use
+.B \-\-no-hash
+only when hash integrity is not required.  MD5 is provided solely for
+interoperability with legacy workflows; SHA-256 or BLAKE3 are preferred for
+forensic purposes.
+.SS Metadata preservation
+On macOS, access time, modification time, birthtime (via
+.BR setattrlist (2)),
+Unix permissions, ownership (
+.BR chown (2)),
+and extended attributes are preserved.  On Windows, creation time is set via
+.BR SetFileTime .  On Linux, birthtime preservation is not supported and logs a
+per-file metadata warning; all other attributes are preserved.  Metadata errors
+are non-fatal and counted separately from copy/hash failures.
+.SS AppleDouble (._) files
+Files whose names begin with
+.B ._
+are excluded from the copy.  These are AppleDouble resource-fork sidecar files
+created by macOS HFS+ on non-HFS volumes and rarely contain evidentiary data.
+.SS Rayon parallelism
+The copy loop uses a Rayon thread pool sized by the
+.B \-\-speed
+flag:
+.B full
+(all logical CPUs, default),
+.B half
+(half of logical CPUs, minimum 1), or
+.B slow
+(single thread).
+All destination directories are pre-created before the parallel loop begins to
+prevent race conditions.  Progress output uses the
+.B indicatif
+multi-progress renderer; per-file progress bars appear only for files larger
+than 100\ MiB.
+.SS iCloud Production chain of custody
+When
+.B \-\-icloud
+is active the tool enforces SHA-256 full-verify mode and performs three
+comparisons per file:
+.IP \(bu 4
+Source hash vs Apple CSV hash — detects in-transit or local corruption.
+.IP \(bu 4
+Destination hash vs source hash — confirms copy integrity.
+.IP \(bu 4
+Full chain: source hash == destination hash == Apple CSV hash.
+.PP
+Files listed in the Apple CSV but absent from disk are reported as
+.IR "missing evidence" .
+Files on disk but absent from the Apple CSV are flagged
+.IR "not in Apple CSV" .
+.SH AUTHOR
+Christopher (hiddenchameleon).
+.PP
+.I Note:
+no
+.B authors
+field is present in
+.IR Cargo.toml ;
+attribution is taken from the repository commit identity.
+.SH SEE ALSO
+.BR dd (1),
+.BR shasum (1),
+.BR b3sum (1),
+.BR xattr (1),
+.BR mandb (8),
+.BR makewhatis (8)

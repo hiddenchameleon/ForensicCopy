@@ -1,7 +1,7 @@
 use std::time::Instant;
 use std::path::PathBuf;
 use report::ReportConfig;
-use forensic_copy::{HashMode, ConflictMode, hasher::HashingAlgorithm, copier::{self, CopyControl}, report};
+use forensic_copy::{HashMode, ConflictMode, ThreadSpeed, hasher::HashingAlgorithm, copier::{self, CopyControl}, report};
 use std::sync::Arc;
 use forensic_copy::icloud::{ICloudMode, find_production_csv, parse_production_csv};
 
@@ -13,7 +13,7 @@ fn main() {
         println!("       forensic_copy <source> <destination>");
         println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
         println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
-        println!("           [--icloud] [--icloud-csv <path>]");
+        println!("           [--speed full|half|slow] [--icloud] [--icloud-csv <path>]");
         return;
     }
 
@@ -46,7 +46,7 @@ fn main() {
                 println!("Usage: forensic_copy --source <path> [--source <path> ...] --destination <path>");
                 println!("  Options: [--hash sha256|blake3|md5] [--no-hash] [--no-verify] [--report]");
                 println!("           [--report-path <path>] [--on-conflict skip|overwrite|abort]");
-                println!("           [--icloud] [--icloud-csv <path>]");
+                println!("           [--speed full|half|slow] [--icloud] [--icloud-csv <path>]");
                 return;
                 },
         };
@@ -84,6 +84,24 @@ fn main() {
             "abort"     => ConflictMode::Abort,
             other => {
                 println!("Error: unknown conflict mode '{}'. Use skip, overwrite, or abort.", other);
+                return;
+            }
+        };
+    }
+
+    let mut thread_speed = ThreadSpeed::default();
+    let speed_pos = args.iter().position(|a| a == "--speed");
+    if let Some(pos) = speed_pos {
+        if pos + 1 >= args.len() {
+            println!("Error: --speed requires a value (full, half, slow).");
+            return;
+        }
+        thread_speed = match args[pos + 1].as_str() {
+            "full" => ThreadSpeed::Full,
+            "half" => ThreadSpeed::Half,
+            "slow" => ThreadSpeed::Slow,
+            other => {
+                println!("Error: unknown speed '{}'. Use full, half, or slow.", other);
                 return;
             }
         };
@@ -190,7 +208,7 @@ fn main() {
 
     let start = Instant::now();
 
-    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, source_icloud_modes, Arc::new(CopyControl::new()), |_done, _total, _filename| {
+    match copier::forensic_copy(&sources, &destination, &hashing_algorithm, &hash_mode, &conflict_mode, &thread_speed, source_icloud_modes, Arc::new(CopyControl::new()), |_done, _total, _filename| {
         // Progress is printed by forensic_copy via indicatif.
     }, |_file_id, _bytes_done, _bytes_total, _file_size, _is_complete, _is_verifying| {}) {
         Ok((results, dir_errors, missing_from_disk)) => {

@@ -8,7 +8,7 @@ use rayon;
 use crate::errors::ForensicError;
 use crate::hasher::HashingAlgorithm;
 use crate::hasher::{hash_file_with_progress, copy_and_hash};
-use crate::{HashMode, ConflictMode};
+use crate::{HashMode, ConflictMode, ThreadSpeed};
 use crate::icloud::ICloudMode;
 use indicatif::{MultiProgress, ProgressBar, ProgressStyle};
 use std::collections::HashSet;
@@ -503,6 +503,7 @@ pub fn forensic_copy<F, B>(
     algorithm: &HashingAlgorithm,
     hash_mode: &HashMode,
     conflict_mode: &ConflictMode,
+    thread_speed: &ThreadSpeed,
     source_icloud_modes: Vec<Option<ICloudMode>>,
     control: Arc<CopyControl>,
     progress_callback: F,
@@ -632,8 +633,18 @@ where
         (0..entries.len()).map(|_| std::sync::Mutex::new(None)).collect();
     let first_error: std::sync::Mutex<Option<ForensicError>> = std::sync::Mutex::new(None);
 
-    let num_threads = rayon::current_num_threads();
-    rayon::scope(|s| {
+    let num_threads = match thread_speed {
+        ThreadSpeed::Full => rayon::current_num_threads(),
+        ThreadSpeed::Half => (rayon::current_num_threads() / 2).max(1),
+        ThreadSpeed::Slow => 1,
+    };
+
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(num_threads)
+        .build()
+        .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap());
+
+    pool.scope(|s| {
         for _ in 0..num_threads {
             s.spawn(|_| {
                 loop {
